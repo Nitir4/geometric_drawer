@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Build/test artifacts
+.pytest_cache/
+.mypy_cache/
+.coverage*
+
+# Local/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Generated exports
+*.pdf
+*.svg
