@@ -22,3 +22,9 @@ env/
 # Generated exports
 *.pdf
 *.svg
+
+# CAD development cache
+.ruff_cache/
+build/
+dist/
+*.egg-info/
