@@ -1,3 +1,117 @@
+# Geometric Drawer — 2-D CAD
+
+A desktop drafting application with precise numeric controls, a programmable
+command editor and direct canvas editing. All three edit the same document.
+Coordinates use a Cartesian XY plane: X right, Y up, angles counterclockwise
+from +X. Drawings default to millimetres. Zoom and page fitting do not change
+the geometry or export scale.
+
+## Run
+
+Requires Python 3.10+ with Tkinter and a desktop display. Install Tkinter through
+your Python distribution or operating system; the PyPI `tk` package is not Tkinter.
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python main.py
+```
+
+On Windows, use `.venv\Scripts\python.exe` in place of `.venv/bin/python`.
+The initial example is a 120 × 70 mm mounting plate with four holes.
+
+## Draft and edit
+
+Supported geometry: points, lines, polylines, oriented rectangles, circles,
+arcs, ellipses, cubic Bezier curves, compound regions with holes, text and
+linear/radial/angular dimensions.
+
+- **Control panel:** choose a type, enter X/Y, orientation and its dimensions,
+  then Create. Select an entity and Apply to selection to edit its properties.
+  Points in polyline/Bezier fields are local coordinates relative to X/Y and
+  orientation; the line panel uses length and orientation.
+- **Canvas:** choose a tool and click its defining points. Select and drag to
+  move. Square handles edit vertices/radii/sizes; the round orange grip rotates
+  around the entity origin. Shift-click toggles multi-selection; dragging an
+  empty area selects fully enclosed entities. Enter finishes a polyline; Esc
+  cancels a gesture. Middle drag pans and the wheel zooms around the cursor.
+- **Code:** enter CAD commands and Run. Replace drawing is an explicit option.
+  A script succeeds as one undoable transaction or leaves the drawing intact.
+  Drawing → code captures current numeric/mouse edits as an editable script.
+
+Grid and object snaps, ortho drafting, layer visibility/locking/colors,
+construction geometry, a physical scale bar and undo/redo are available.
+Object snaps include endpoints, midpoints, centres, quadrants and actual intersections of lines, circles/arcs, rectangle
+edges, open/closed polyline edges, ellipses and cubic Beziers. Intersection search
+filters candidates near the cursor; it excludes line extensions and missing arc
+sectors and does not depend on display tessellation. Dense scenes are not broadly
+stress-tested.
+
+Modification controls provide move, copy, rotate, uniform scale, mirror, arrays,
+offset, line trim/extend, fillet and chamfer. Pivot X/Y controls rotation/scale
+origin and the trim pick point. Mirror uses the pivot and rotation field as its
+axis. Array count includes the original and uses dx/dy plus per-copy rotation.
+
+Offset supports lines/open polylines (positive left), circles/arcs and
+rectangles/closed polylines (positive outward), ellipses (positive outward) and
+cubic Beziers (positive left). Ellipse/Bezier offsets become editable polylines;
+`curve tol` sets the chord-error bound in current drawing units (default 0.01).
+The source stays analytic. Native/code records retain construction tolerance;
+uniform scaling/unit conversion scales it, and reshaping clears it.
+Use `OFFSET oval distance=2 tolerance=0.01` or
+`doc.offset("oval", 2, tolerance=0.01)` for the same operation.
+Local curvature folds/cusps, stationary Bezier tangents and generated-polyline
+self-intersections/overlaps are rejected. Accuracy/regularity must be established
+within 8192 segments and 24 subdivision levels; otherwise the operation rolls back.
+This is a normal-distance approximation, not enlargement of ellipse axes or an
+exact offset Bezier. Offsets regenerate when their sources change by default.
+Polyline corners are mitered;
+collapsing, reversing and self-intersecting offsets are rejected. Trim/extend
+supports lines, circles and circular arcs, interpreting a straight cutter as an
+infinite cutting boundary. Fillet/chamfer supports two nonparallel straight lines,
+including separated legs (trimmed/extended as needed) and crossing segments.
+Amount is the radius or equal setback distance. For crossing lines, set Pivot X/Y
+inside the intended corner to choose the retained sides; a pick on either line
+is ambiguous and rejected. Shared endpoints still work without a pick. Existing
+driving constraints are solved and the corner joins checked before accepting;
+conflicting rules reject the whole edit. **Linked** is enabled by default. Linked
+fillets keep the untrimmed sources as dashed construction geometry and create
+trimmed copies plus the tangent connector. **Select sources** returns to the
+editable originals; **Update feature** applies Amount/Curve tol to the selected
+result; **Detach** preserves the finished geometry and removes its link. Uncheck
+Linked (or pass `linked=False` / `linked=false`) for standalone operations.
+Parallel lines support a semicircular round with radius half their separation.
+Radius zero makes a sharp straight-line join. Positive curved fillets support
+lines, circles/arcs, ellipses and cubic Beziers: open legs trim; closed circles and
+ellipses remain whole tangent boundaries. Ellipse/Bezier solutions use bounded
+multistart refinement; failure to find a solution is not proof none exists.
+**Round path** rounds all eligible polyline/rectangle corners into a polyline
+with chord-error tolerance; Python/DSL can select one vertex.
+**Clean offset** uses GEOS to repair a planar region and retain all offset
+boundary components, including holes. Round/mitre/bevel join controls apply here.
+Closed cleanup treats positive distance as outward; open paths use positive left.
+Curved sources are sampled first, so this is a planar cleanup approximation,
+not the same guarantee as the strict normal-offset kernel. **Cleanup as filled
+regions** keeps each exterior and its holes in one editable region (enabled in
+the GUI); disable it for boundary wires. Python/DSL use `as_regions=True` /
+`regions=true`. Linked cleanup splits and merges automatically. Geometric overlap
+and proximity preserve component IDs in the source frame; new components get new
+IDs and merged references follow the surviving component. A vanished component
+retires its dependent feature branch and freezes associated measurements. Undo
+restores it. Empty features remain listed by ID and can regenerate when their
+parameters or source change. Ambiguous identity is resolved deterministically,
+not by a guarantee of design intent. Invalid or locked dependent edits roll back.
+Invalid combinations are rejected without changing the drawing. Uniform scale
+preserves circles.
+
+**Dimension selection** creates a measurement that follows a selected line,
+circle or arc. Editing its source updates the measurement. Deleting the source,
+or independently transforming/editing the dimension geometry, freezes it as a
+standalone annotation. Offset-only property edits retain the association.
+Free linear/radial/angular annotations can also be created with canvas tools.
+
+
+Optional **Perpendicular** and **Tangent** controls appear below the toolbar.
 Enable Object snap, choose Line, and place its first point. Move near the desired
 foot/contact point and click: perpendicular supports finite straight edges and
 circle/arc/ellipse/Bezier normals; tangent supports circles/arcs/ellipses and
