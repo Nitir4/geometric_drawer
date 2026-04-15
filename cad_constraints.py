@@ -1,3 +1,144 @@
+"""Persistent planar sketch constraints and a transactional numerical solver.
+
+Point references are ``entity@index`` (zero-based vertices), or just an entity
+ID for its origin/centre. Lines use world endpoints as solver coordinates;
+rectangles retain origin, rotation and positive width/height.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+
+try:
+    from .cad_geometry import EPS, angle, distance, finite, positive, sub
+except ImportError:
+    from cad_geometry import EPS, angle, distance, finite, positive, sub
+
+KINDS = (
+    "fixed",
+    "horizontal",
+    "vertical",
+    "length",
+    "radius",
+    "width",
+    "height",
+    "angle",
+    "coincident",
+    "distance",
+    "parallel",
+    "perpendicular",
+    "equal_length",
+    "concentric",
+    "tangent",
+    "curve_tangent",
+    "free_tangent",
+    "angle_between",
+    "symmetry",
+    "arc_start",
+    "arc_sweep",
+    "equal_radius",
+    "rx",
+    "ry",
+)
+SUPPORTED = {
+    "point",
+    "line",
+    "circle",
+    "arc",
+    "rectangle",
+    "ellipse",
+    "polyline",
+    "bezier",
+    "region",
+}
+
+
+def entity_id(ref):
+    return ref.rsplit("@", 1)[0] if "@" in ref else ref
+
+
+def coordinates(e):
+    if e.kind == "line":
+        return [v for p in e.vertices() for v in p]
+    if e.kind in ("polyline", "bezier"):
+        return [v for p in e.vertices() for v in p]
+    if e.kind == "region":
+        return [
+            e.x,
+            e.y,
+            e.angle,
+            *[v for ring in e.data["rings"] for p in ring for v in p],
+        ]
+    values = [e.x, e.y]
+    if e.kind == "rectangle":
+        values += [e.angle, e.data["width"], e.data["height"]]
+    elif e.kind in ("circle", "arc"):
+        values += [e.data["radius"]]
+        if e.kind == "arc":
+            values += [e.angle, e.data["start"], e.data["sweep"]]
+    elif e.kind == "ellipse":
+        values += [e.angle, e.data["rx"], e.data["ry"]]
+        if "start" in e.data or "sweep" in e.data:
+            values += [e.data.get("start", 0), e.data.get("sweep", 360)]
+    return values
+
+
+def assign(e, values):
+    if e.kind == "line":
+        a, b = values[:2], values[2:]
+        e.x, e.y, e.angle = *a, angle(sub(b, a))
+        e.data["points"] = [(0, 0), (distance(a, b), 0)]
+    elif e.kind in ("polyline", "bezier"):
+        e.x = e.y = e.angle = 0
+        e.data["points"] = list(zip(values[::2], values[1::2]))
+    elif e.kind == "region":
+        e.x, e.y, e.angle = values[:3]
+        at = 3
+        for ring in e.data["rings"]:
+            for i in range(len(ring)):
+                ring[i] = tuple(values[at : at + 2])
+                at += 2
+    else:
+        e.x, e.y = values[:2]
+        if e.kind == "rectangle":
+            e.angle, e.data["width"], e.data["height"] = values[2:]
+        elif e.kind in ("circle", "arc"):
+            e.data["radius"] = values[2]
+            if e.kind == "arc":
+                e.angle, e.data["start"], e.data["sweep"] = values[3:]
+        elif e.kind == "ellipse":
+            e.angle, e.data["rx"], e.data["ry"] = values[2:5]
+            if len(values) == 7:
+                e.data["start"], e.data["sweep"] = values[5:]
+
+
+def point(doc, ref):
+    if "@" not in ref:
+        e = doc.entities[ref]
+        return e.x, e.y
+    id, index = ref.rsplit("@", 1)
+    e = doc.entities[id]
+    if not index.isdigit():
+        raise ValueError("Point reference must use a zero-based vertex index.")
+    vertices = e.handles() if e.kind == "arc" else e.vertices()
+    if int(index) >= len(vertices):
+        raise ValueError(f"Vertex index out of range: {ref}")
+    return vertices[int(index)]
+
+
+def validate_constraint(doc, c):
+    if set(c) - {"id", "kind", "refs", "value", "state", "parameters"}:
+        raise ValueError("Unknown constraint property.")
+    if not isinstance(c.get("id"), str) or not c["id"] or c.get("kind") not in KINDS:
+        raise ValueError("Invalid constraint ID or kind.")
+    kind, refs = c["kind"], c.get("refs")
+    count = (
+        3
+        if kind == "symmetry"
+        else (
+            2
+            if kind
             in (
                 "coincident",
                 "distance",
