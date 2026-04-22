@@ -1,3 +1,443 @@
+                "bindings": self.bindings,
+                "blocks": self.blocks,
+                "groups": self.groups,
+            }
+        )
+
+    def _restore(self, state):
+        self.blocks = copy.deepcopy(state.get("blocks", {}))
+        self.groups = copy.deepcopy(state.get("groups", {}))
+        self.parameters = copy.deepcopy(state.get("parameters", {}))
+        self.bindings = copy.deepcopy(state.get("bindings", []))
+        self.features = {f["id"]: copy.deepcopy(f) for f in state.get("features", [])}
+        self._feature_cache = {}
+        self.topology_events = []
+        self.constraints = {
+            c["id"]: copy.deepcopy(c) for c in state.get("constraints", [])
+        }
+        self.units = state["units"]
+        self.active_layer = state["active_layer"]
+        self.layers = {v["name"]: Layer(**copy.deepcopy(v)) for v in state["layers"]}
+        self.entities = {v["id"]: Entity(**copy.deepcopy(v)) for v in state["entities"]}
+
+    def validate(self):
+        if (
+            self.units not in UNIT_MM
+            or "0" not in self.layers
+            or self.active_layer not in self.layers
+        ):
+            raise ValueError("Invalid units, default layer or active layer.")
+        if len(self.entities) > 20000:
+            raise ValueError("Drawing exceeds 20000 entities.")
+        if len(self.constraints) > 5000:
+            raise ValueError("Drawing exceeds 5000 constraints.")
+        for layer in self.layers.values():
+            layer.validate()
+        for e in self.entities.values():
+            e.validate()
+            if e.layer not in self.layers:
+                raise ValueError(f"Missing layer: {e.layer}")
+            ref = e.data.get("ref")
+            if ref and (
+                ref not in self.entities
+                or self.entities[ref].kind not in ("line", "circle", "arc")
+            ):
+                raise ValueError("Dimension reference must name a line, circle or arc.")
+        try:
+            from .cad_constraints import residual, validate_constraint
+        except ImportError:
+            from cad_constraints import residual, validate_constraint
+        for c in self.constraints.values():
+            validate_constraint(self, c)
+            if max(abs(v) for v in residual(self, c)) > 1e-7:
+                raise ValueError("Drawing contains unsatisfied constraints.")
+        self.validate_assemblies()
+        self.apply_parameters(check=True)
+        self.regenerate_features(check=True)
+        self.refresh_dimensions()
+
+    def refresh_dimensions(self):
+        for e in self.entities.values():
+            ref = self.entities.get(e.data.get("ref"))
+            if ref is None:
+                continue
+            if e.kind == "dimension" and ref.kind == "line":
+                a, b = ref.vertices()
+                e.x, e.y, e.angle = *a, 0
+                e.data["points"] = [(0, 0), sub(b, a)]
+            elif e.kind == "radial_dimension" and ref.kind in ("circle", "arc"):
+                e.x, e.y = ref.x, ref.y
+                e.data["radius"] = ref.data["radius"]
+            else:
+                raise ValueError("Dimension type does not match its referenced entity.")
+
+    @contextmanager
+    def transaction(self, label="Edit"):
+        before = self.snapshot()
+        outer = self._depth == 0
+        if outer:
+            self.topology_events = []
+        self._depth += 1
+        try:
+            yield self
+            if outer:
+                self.apply_parameters()
+                if self.constraints or self.bindings:
+                    self.solve_constraints()
+                self.regenerate_features()
+                self.validate()
+        except Exception:
+            self._restore(before)
+            raise
+        else:
+            if outer and before != self.snapshot():
+                self._undo.append((label, before))
+                self._undo = self._undo[-100:]
+                self._redo.clear()
+        finally:
+            self._depth -= 1
+
+    def undo(self):
+        if self._undo:
+            label, state = self._undo.pop()
+            self._redo.append((label, self.snapshot()))
+            self._restore(state)
+            return label
+
+    def redo(self):
+        if self._redo:
+            label, state = self._redo.pop()
+            self._undo.append((label, self.snapshot()))
+            self._restore(state)
+            return label
+
+    def constrain(
+        self, kind, refs, value=None, *, id=None, state=None, parameters=None
+    ):
+        """Create a driving constraint and solve the sketch as one undoable edit."""
+        try:
+            from .cad_constraints import coordinates
+        except ImportError:
+            from cad_constraints import coordinates
+        with self.transaction("Add constraint"):
+            id = id or self.unique_constraint_id()
+            if id in self.constraints:
+                raise ValueError(f"Duplicate constraint ID: {id}")
+            if state is not None and kind != "fixed":
+                raise ValueError("Only fixed constraints accept saved state.")
+            c = {"id": id, "kind": kind, "refs": list(refs)}
+            if kind == "free_tangent" and parameters is None:
+                parameters = [0.5, 0.5]
+            if parameters is not None:
+                c["parameters"] = [finite(t) for t in parameters]
+            if value is not None:
+                c["value"] = finite(value)
+            if kind == "fixed":
+                c["state"] = (
+                    copy.deepcopy(state)
+                    if state is not None
+                    else coordinates(self.entities[c["refs"][0]])
+                )
+            self.constraints[id] = c
+        return id
+
+    def unique_constraint_id(self):
+        n = 1
+        while f"c{n}" in self.constraints:
+            n += 1
+        return f"c{n}"
+
+    def remove_constraint(self, id):
+        with self.transaction("Remove constraint"):
+            del self.constraints[id]
+            self.prune_bindings()
+
+    def set_constraint_value(self, id, value):
+        with self.transaction("Edit driving value"):
+            self.constraints[id]["value"] = finite(value)
+
+    def set_constraint_parameters(self, id, parameters):
+        with self.transaction("Edit contact parameters"):
+            self.constraints[id]["parameters"] = [finite(t) for t in parameters]
+
+    def solve_constraints(self):
+        try:
+            from .cad_constraints import solve
+        except ImportError:
+            from cad_constraints import solve
+        shapes = {
+            e.id: list(e.data["points"])
+            for e in self.entities.values()
+            if "offset_approximation" in e.data
+        }
+        report = solve(self)
+        for id, points in shapes.items():
+            if self.entities[id].data["points"] != points:
+                self.entities[id].data.pop("offset_approximation", None)
+        return report
+
+    def constraint_report(self):
+        try:
+            from .cad_constraints import solve
+        except ImportError:
+            from cad_constraints import solve
+        return solve(self, apply=False)
+
+    def unique_id(self, prefix="e"):
+        # Reserve room for numeric suffixes even through long feature/copy chains.
+        prefix = prefix[:110]
+        n = 1
+        while f"{prefix}{n}" in self.entities:
+            n += 1
+        return f"{prefix}{n}"
+
+    def editable(self, ids, *, allow_derived=False):
+        entities = [self.entities[i] for i in ids]
+        if not allow_derived and any(self.feature_for(e.id) for e in entities):
+            raise ValueError("Edit the linked source, or detach the output first.")
+        if any(self.layers[e.layer].locked for e in entities):
+            raise ValueError("Unlock the layer before editing its geometry.")
+        return entities
+
+    def add(
+        self, kind, id=None, x=0, y=0, angle=0, layer=None, construction=False, **data
+    ):
+        with self.transaction("Create " + kind):
+            id = id or self.unique_id(kind)
+            if id in self.entities:
+                raise ValueError(f"Duplicate entity ID: {id}")
+            layer = layer or self.active_layer
+            if layer not in self.layers or self.layers[layer].locked:
+                raise ValueError("Choose an existing unlocked layer.")
+            if kind in ("dimension", "radial_dimension", "angular_dimension"):
+                data.setdefault("text_height", 2.5 / UNIT_MM[self.units])
+            e = Entity(
+                id, kind, x, y, angle, layer, copy.deepcopy(data), construction
+            ).validate()
+            self.entities[id] = e
+        return id
+
+    def line(self, x1, y1, x2=None, y2=None, *, length=None, angle=0, **kwargs):
+        if length is not None:
+            return self.add(
+                "line",
+                x=x1,
+                y=y1,
+                angle=angle,
+                points=[(0, 0), (positive(length), 0)],
+                **kwargs,
+            )
+        if x2 is None or y2 is None:
+            raise ValueError("Provide both endpoint coordinates or length/angle.")
+        return self.add(
+            "line", x=x1, y=y1, points=[(0, 0), (x2 - x1, y2 - y1)], **kwargs
+        )
+
+    def rectangle(self, x, y, width, height, angle=0, **kwargs):
+        return self.add(
+            "rectangle", x=x, y=y, angle=angle, width=width, height=height, **kwargs
+        )
+
+    def circle(self, x, y, radius, **kwargs):
+        return self.add("circle", x=x, y=y, radius=radius, **kwargs)
+
+    def arc(self, x, y, radius, start=0, sweep=90, **kwargs):
+        return self.add(
+            "arc", x=x, y=y, radius=radius, start=start, sweep=sweep, **kwargs
+        )
+
+    def polyline(self, points, closed=False, **kwargs):
+        return self.add("polyline", points=points, closed=closed, **kwargs)
+
+    def region(
+        self, outer, holes=(), *, hatch="solid", spacing=2, hatch_angle=45, **kwargs
+    ):
+        return self.add(
+            "region",
+            rings=[outer, *holes],
+            hatch=hatch,
+            spacing=spacing,
+            hatch_angle=hatch_angle,
+            **kwargs,
+        )
+
+    def dimension(self, entity_id, offset=8, **kwargs):
+        ref = self.entities[entity_id]
+        if ref.kind == "line":
+            a, b = ref.vertices()
+            return self.add(
+                "dimension",
+                x=a[0],
+                y=a[1],
+                points=[(0, 0), sub(b, a)],
+                offset=offset,
+                ref=entity_id,
+                **kwargs,
+            )
+        if ref.kind in ("circle", "arc"):
+            return self.add(
+                "radial_dimension",
+                x=ref.x,
+                y=ref.y,
+                radius=ref.data["radius"],
+                ref=entity_id,
+                **kwargs,
+            )
+        raise ValueError("Associative dimensions support lines, circles and arcs.")
+
+    def replace(self, e):
+        with self.transaction("Edit properties"):
+            original = self.editable([e.id])[0]
+            if e.layer not in self.layers or self.layers[e.layer].locked:
+                raise ValueError("Target layer must exist and be unlocked.")
+            replacement = copy.deepcopy(e)
+            if original.data.get("points") != replacement.data.get(
+                "points"
+            ) or original.data.get("closed") != replacement.data.get("closed"):
+                replacement.data.pop("offset_approximation", None)
+                replacement.data.pop("cleanup", None)
+            self.entities[e.id] = replacement.validate()
+
+    def delete(self, ids, *, expand=True):
+        ids = [ids] if isinstance(ids, str) else list(ids)
+        with self.transaction("Delete"):
+            ids = self.expand_selection(ids) if expand else list(dict.fromkeys(ids))
+            self.editable(ids, allow_derived=True)
+            removed = set(ids)
+            while True:
+                affected = [
+                    f
+                    for f in self.features.values()
+                    if removed.intersection(f["sources"] + f["outputs"])
+                ]
+                if not affected:
+                    break
+                for f in affected:
+                    removed.update(f["outputs"])
+                    del self.features[f["id"]]
+            ids = list(removed)
+            self.editable(ids, allow_derived=True)
+            # Freeze dependent dimensions at their last measured geometry.
+            for e in self.entities.values():
+                if e.data.get("ref") in ids:
+                    e.data.pop("ref")
+            self.constraints = {
+                k: c
+                for k, c in self.constraints.items()
+                if not any(r.rsplit("@", 1)[0] in ids for r in c["refs"])
+            }
+            for id in ids:
+                del self.entities[id]
+            self.prune_bindings()
+            self.prune_groups()
+
+    def clear(self):
+        with self.transaction("Clear drawing"):
+            self.entities.clear()
+            self.constraints.clear()
+            self.features.clear()
+            self._feature_cache.clear()
+            self.parameters.clear()
+            self.bindings.clear()
+            self.blocks.clear()
+            self.groups.clear()
+
+    def set_layer(self, name, **changes):
+        with self.transaction("Edit layer"):
+            layer = copy.deepcopy(self.layers.get(name, Layer(name)))
+            for k, v in changes.items():
+                if k not in ("color", "visible", "locked", "width"):
+                    raise ValueError(f"Unknown layer property: {k}")
+                setattr(layer, k, v)
+            layer.validate()
+            self.layers[name] = layer
+
+    def set_units(self, units):
+        if units not in UNIT_MM:
+            raise ValueError("Units must be mm, cm, m or in.")
+        with self.transaction("Convert drawing units"):
+            factor = UNIT_MM[self.units] / UNIT_MM[units]
+            for e in self.entities.values():
+                self._scale_entity(e, factor, (0, 0))
+            for definition in self.blocks.values():
+                for state in definition:
+                    e = Entity(**copy.deepcopy(state))
+                    self._scale_entity(e, factor, (0, 0))
+                    state.update(e.to_dict())
+            for l in self.layers.values():
+                l.width *= factor
+            try:
+                from .cad_constraints import coordinates
+            except ImportError:
+                from cad_constraints import coordinates
+            for c in self.constraints.values():
+                if c["kind"] in (
+                    "length",
+                    "radius",
+                    "width",
+                    "height",
+                    "distance",
+                    "rx",
+                    "ry",
+                ):
+                    c["value"] *= factor
+                elif c["kind"] == "fixed":
+                    e = copy.deepcopy(self.entities[c["refs"][0]])
+                    # Fixed targets are converted independently of current geometry.
+                    try:
+                        from .cad_constraints import assign
+                    except ImportError:
+                        from cad_constraints import assign
+                    assign(e, c["state"])
+                    self._scale_entity(e, factor, (0, 0))
+                    c["state"] = coordinates(e)
+            for f in self.features.values():
+                if f["kind"] == "block":
+                    f["params"]["x"] *= factor
+                    f["params"]["y"] *= factor
+                if "frame" in f:
+                    f["frame"]["x"] *= factor
+                    f["frame"]["y"] *= factor
+                for key in ("amount", "radius", "tolerance"):
+                    if key in f["params"]:
+                        f["params"][key] *= factor
+                if f["params"].get("pick") is not None:
+                    f["params"]["pick"] = [v * factor for v in f["params"]["pick"]]
+            self.units = units
+
+    def transform(
+        self, ids, *, dx=0, dy=0, rotation=0, scale=1, pivot=(0, 0), copy_entities=False
+    ):
+        dx, dy, rotation, scale = (
+            finite(dx),
+            finite(dy),
+            finite(rotation),
+            positive(scale),
+        )
+        pivot = tuple(finite(v) for v in pivot)
+        if len(pivot) != 2:
+            raise ValueError("Pivot needs exactly two coordinates.")
+        with self.transaction("Copy" if copy_entities else "Transform"):
+            ids = self.expand_selection(ids)
+            source_groups = {
+                name: list(members)
+                for name, members in self.groups.items()
+                if set(members).issubset(ids)
+            }
+            plain, result, mapping = self.transform_blocks(
+                ids,
+                dx=dx,
+                dy=dy,
+                rotation=rotation,
+                scale=scale,
+                pivot=pivot,
+                copy_entities=copy_entities,
+            )
+            originals = self.editable(plain, allow_derived=copy_entities)
+            selected = set(ids)
+            for original in originals:
+                e = copy.deepcopy(original)
+                if e.data.get("ref") and e.data["ref"] not in selected:
                     e.data.pop("ref")
                 if copy_entities:
                     e.id = self.unique_id(original.id + "_")
