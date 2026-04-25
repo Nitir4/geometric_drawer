@@ -1,3 +1,115 @@
+"""Shared editable CAD document, transactions and public Python API."""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import os
+import re
+import tempfile
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+try:
+    from .cad_geometry import (
+        EPS,
+        Entity,
+        add,
+        angle,
+        distance,
+        finite,
+        line_intersection,
+        mul,
+        positive,
+        rotate,
+        sub,
+        unit,
+    )
+except ImportError:
+    from cad_geometry import (
+        EPS,
+        Entity,
+        add,
+        angle,
+        distance,
+        finite,
+        line_intersection,
+        mul,
+        positive,
+        rotate,
+        sub,
+        unit,
+    )
+
+UNIT_MM = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "in": 25.4}
+
+
+@dataclass
+class Layer:
+    name: str
+    color: str = "#243e58"
+    visible: bool = True
+    locked: bool = False
+    width: float = 0.25
+
+    def validate(self):
+        if (
+            not isinstance(self.name, str)
+            or not self.name
+            or len(self.name) > 120
+            or not re.fullmatch(r'[^<>/\\":;?*|=\x00-\x1f]+', self.name)
+        ):
+            raise ValueError("Layer name contains invalid CAD characters.")
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", self.color):
+            raise ValueError("Layer color must be #RRGGBB.")
+        self.width = positive(self.width)
+        if type(self.visible) is not bool or type(self.locked) is not bool:
+            raise ValueError("Layer visibility and locking must be booleans.")
+
+
+try:
+    from .cad_assemblies import Assemblies
+    from .cad_linked import LinkedFeatures
+    from .cad_parameters import Parameters
+except ImportError:
+    from cad_assemblies import Assemblies
+    from cad_linked import LinkedFeatures
+    from cad_parameters import Parameters
+
+
+class Document(LinkedFeatures, Parameters, Assemblies):
+    """All public mutations are atomic and undoable, including whole scripts."""
+
+    def __init__(self):
+        self.units = "mm"
+        self.layers = {"0": Layer("0")}
+        self.entities = {}
+        self.constraints = {}
+        self.features = {}
+        self.parameters = {}
+        self.bindings = []
+        self.blocks = {}
+        self.groups = {}
+        self._feature_cache = {}
+        self.topology_events = []
+        self.active_layer = "0"
+        self._undo, self._redo = [], []
+        self._depth = 0
+
+    def snapshot(self):
+        return copy.deepcopy(
+            {
+                "format": "geometric-drawer",
+                "version": 2,
+                "units": self.units,
+                "active_layer": self.active_layer,
+                "layers": [asdict(v) for v in self.layers.values()],
+                "entities": [v.to_dict() for v in self.entities.values()],
+                "constraints": list(self.constraints.values()),
+                "features": list(self.features.values()),
+                "parameters": self.parameters,
                 "bindings": self.bindings,
                 "blocks": self.blocks,
                 "groups": self.groups,
