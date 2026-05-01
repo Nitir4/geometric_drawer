@@ -1,3 +1,382 @@
+"""Model-space DXF exchange and true-size SVG/PDF output."""
+
+from __future__ import annotations
+
+import math
+import os
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+try:
+    from .cad_document import UNIT_MM, Document
+    from .cad_geometry import EPS, add, angle, distance, polar, sub
+except ImportError:
+    from cad_document import UNIT_MM, Document
+    from cad_geometry import EPS, add, angle, distance, polar, sub
+
+
+def plotted(doc, construction=False):
+    return [
+        e
+        for e in doc.entities.values()
+        if doc.layers[e.layer].visible and (construction or not e.construction)
+    ]
+
+
+def sheet(doc, construction=False):
+    entities = plotted(doc, construction)
+    boxes = [e.bounds() for e in entities]
+    if not boxes:
+        return (0, 0, 100, 100)
+    # Five physical millimetres of margin, regardless of document units.
+    margin = 5 / UNIT_MM[doc.units]
+    return (
+        min(b[0] for b in boxes) - margin,
+        min(b[1] for b in boxes) - margin,
+        max(b[2] for b in boxes) + margin,
+        max(b[3] for b in boxes) + margin,
+    )
+
+
+def export_svg(doc, path, construction=False):
+    doc.validate()
+    x0, y0, x1, y1 = sheet(doc, construction)
+    w, h, mm = x1 - x0, y1 - y0, UNIT_MM[doc.units]
+    ns = "http://www.w3.org/2000/svg"
+    ET.register_namespace("", ns)
+    root = ET.Element(
+        f"{{{ns}}}svg",
+        width=f"{w * mm:.12g}mm",
+        height=f"{h * mm:.12g}mm",
+        viewBox=f"{x0:.12g} {-y1:.12g} {w:.12g} {h:.12g}",
+    )
+    ET.SubElement(
+        root, f"{{{ns}}}title"
+    ).text = "Geometric Drawer — model-space drawing"
+
+    def node(tag, attributes, parent=root):
+        return ET.SubElement(
+            parent, f"{{{ns}}}{tag}", {k: str(v) for k, v in attributes.items()}
+        )
+
+    for e in plotted(doc, construction):
+        l, d, k = doc.layers[e.layer], e.data, e.kind
+        attrs = {
+            "stroke": l.color if d.get("outline", True) else "none",
+            "stroke-width": l.width,
+            "fill": l.color if d.get("fill") else "none",
+            "stroke-linejoin": "round",
+        }
+        if e.construction:
+            attrs["stroke-dasharray"] = f"{l.width * 8} {l.width * 5}"
+        g = node("g", {"id": e.id, "data-layer": e.layer})
+        if k == "region":
+            try:
+                from .cad_regions import hatch_segments
+            except ImportError:
+                from cad_regions import hatch_segments
+            pathdata = " ".join(
+                "M " + " L ".join(f"{x} {-y}" for x, y in ring) + " Z"
+                for ring in e.paths()
+            )
+            region_attrs = dict(attrs, d=pathdata)
+            region_attrs["fill-rule"] = "evenodd"
+            region_attrs["fill"] = l.color if d["hatch"] == "solid" else "none"
+            node("path", region_attrs, g)
+            for a, b in hatch_segments(e):
+                node(
+                    "line",
+                    dict(attrs, x1=a[0], y1=-a[1], x2=b[0], y2=-b[1], fill="none"),
+                    g,
+                )
+        elif k == "circle":
+            node("circle", dict(attrs, cx=e.x, cy=-e.y, r=d["radius"]), g)
+        elif k == "ellipse":
+            if abs(d.get("sweep", 360)) >= 360 - EPS:
+                node(
+                    "ellipse",
+                    dict(
+                        attrs,
+                        cx=e.x,
+                        cy=-e.y,
+                        rx=d["rx"],
+                        ry=d["ry"],
+                        transform=f"rotate({-e.angle} {e.x} {-e.y})",
+                    ),
+                    g,
+                )
+            else:
+                from math import cos, radians, sin
+
+                start, sweep = d.get("start", 0), d["sweep"]
+
+                def endpoint(t, e=e, d=d):
+                    return e.world(
+                        (d["rx"] * cos(radians(t)), d["ry"] * sin(radians(t)))
+                    )
+
+                a, b = endpoint(start), endpoint(start + sweep)
+                pathdata = f"M {a[0]} {-a[1]} A {d['rx']} {d['ry']} {-e.angle} {int(abs(sweep) > 180)} {int(sweep < 0)} {b[0]} {-b[1]}"
+                node("path", dict(attrs, d=pathdata), g)
+        elif k == "arc":
+            start, sweep = d["start"] + e.angle, d["sweep"]
+            pieces = 2 if abs(sweep) >= 360 - EPS else 1
+            a = add((e.x, e.y), polar(d["radius"], start))
+            pathdata = f"M {a[0]} {-a[1]}"
+            for i in range(1, pieces + 1):
+                b = add((e.x, e.y), polar(d["radius"], start + sweep * i / pieces))
+                pathdata += f" A {d['radius']} {d['radius']} 0 {int(abs(sweep / pieces) > 180)} {int(sweep < 0)} {b[0]} {-b[1]}"
+            node("path", dict(attrs, d=pathdata), g)
+        elif k == "bezier":
+            p = e.vertices()
+            text = f"M {p[0][0]} {-p[0][1]} C " + " ".join(
+                f"{x} {-y}" for x, y in p[1:]
+            )
+            node("path", dict(attrs, d=text), g)
+        elif k == "point":
+            node("circle", dict(attrs, cx=e.x, cy=-e.y, r=l.width * 2), g)
+        else:
+            for p in e.paths():
+                node(
+                    "polyline",
+                    dict(attrs, points=" ".join(f"{x},{-y}" for x, y in p)),
+                    g,
+                )
+        label = e.label()
+        if label:
+            (x, y), text, height = label
+            n = node(
+                "text",
+                {
+                    "x": x,
+                    "y": -y,
+                    "font-size": height,
+                    "font-family": "sans-serif",
+                    "fill": l.color,
+                    "transform": f"rotate({-e.angle} {x} {-y})",
+                },
+                g,
+            )
+            n.text = text
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def export_pdf(doc, path, construction=False, print_scale=1):
+    from reportlab.lib.colors import HexColor
+    from reportlab.pdfgen import canvas
+
+    doc.validate()
+    labels = [e.label()[1] for e in plotted(doc, construction) if e.label()]
+    font = "Helvetica"
+    if any(ord(ch) > 127 for text in labels for ch in text):
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+
+        candidates = [
+            os.environ.get("CAD_FONT_PATH", ""),
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/Library/Fonts/Arial Unicode.ttf",
+        ]
+        selected = next((p for p in candidates if p and Path(p).is_file()), None)
+        if not selected:
+            raise ValueError(
+                "Unicode PDF text requires a TrueType font; set CAD_FONT_PATH to its file."
+            )
+        font = "CADUnicode_" + str(abs(hash(selected)))
+        if font not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(font, selected))
+        available = pdfmetrics.getFont(font).face.charToGlyph
+        missing = sorted(
+            {
+                ch
+                for text in labels
+                for ch in text
+                if ord(ch) not in available and not ch.isspace()
+            }
+        )
+        if missing:
+            raise ValueError(
+                "PDF font lacks glyphs: "
+                + " ".join(missing)
+                + "; choose CAD_FONT_PATH with coverage."
+            )
+
+    if not math.isfinite(print_scale) or print_scale <= 0:
+        raise ValueError("Print scale must be positive.")
+    x0, y0, x1, y1 = sheet(doc, construction)
+    factor = UNIT_MM[doc.units] * 72 / 25.4 * print_scale
+    c = canvas.Canvas(str(path), pagesize=((x1 - x0) * factor, (y1 - y0) * factor))
+    c.setTitle("Geometric Drawer — 2-D CAD")
+    c.translate(-x0 * factor, -y0 * factor)
+    c.scale(factor, factor)
+    for e in plotted(doc, construction):
+        l, d, k = doc.layers[e.layer], e.data, e.kind
+        c.setStrokeColor(HexColor(l.color))
+        c.setFillColor(HexColor(l.color))
+        c.setLineWidth(l.width)
+        c.setDash(l.width * 8, l.width * 5) if e.construction else c.setDash()
+        if k == "region":
+            try:
+                from .cad_regions import hatch_segments
+            except ImportError:
+                from cad_regions import hatch_segments
+            obj = c.beginPath()
+            for ring in e.paths():
+                obj.moveTo(*ring[0])
+                for p in ring[1:]:
+                    obj.lineTo(*p)
+                obj.close()
+            c.drawPath(
+                obj,
+                stroke=int(d.get("outline", True)),
+                fill=int(d["hatch"] == "solid"),
+                fillMode=0,
+            )
+            for a, b in hatch_segments(e):
+                c.line(*a, *b)
+        elif k == "circle":
+            c.circle(e.x, e.y, d["radius"], fill=int(bool(d.get("fill"))))
+        elif k == "arc":
+            r = d["radius"]
+            c.arc(
+                e.x - r,
+                e.y - r,
+                e.x + r,
+                e.y + r,
+                startAng=d["start"] + e.angle,
+                extent=d["sweep"],
+            )
+        elif k == "ellipse":
+            c.saveState()
+            c.translate(e.x, e.y)
+            c.rotate(e.angle)
+            if abs(d.get("sweep", 360)) >= 360 - EPS:
+                c.ellipse(-d["rx"], -d["ry"], d["rx"], d["ry"])
+            else:
+                c.arc(
+                    -d["rx"],
+                    -d["ry"],
+                    d["rx"],
+                    d["ry"],
+                    startAng=d.get("start", 0),
+                    extent=d["sweep"],
+                )
+            c.restoreState()
+        elif k == "bezier":
+            p = e.vertices()
+            obj = c.beginPath()
+            obj.moveTo(*p[0])
+            obj.curveTo(*(v for q in p[1:] for v in q))
+            c.drawPath(obj)
+        elif k == "point":
+            c.circle(e.x, e.y, l.width * 2, fill=1)
+        else:
+            for p in e.paths():
+                obj = c.beginPath()
+                obj.moveTo(*p[0])
+                for q in p[1:]:
+                    obj.lineTo(*q)
+                c.drawPath(
+                    obj,
+                    stroke=int(d.get("outline", True)),
+                    fill=int(bool(d.get("fill"))),
+                )
+        label = e.label()
+        if label:
+            (x, y), text, height = label
+            c.saveState()
+            c.translate(x, y)
+            c.rotate(e.angle)
+            c.setFont(font, height)
+            c.drawString(0, 0, text)
+            c.restoreState()
+    c.showPage()
+    c.save()
+
+
+def export_dxf(doc, path):
+    import ezdxf
+
+    doc.validate()
+    out = ezdxf.new("R2010")
+    out.units = {"mm": 4, "cm": 5, "m": 6, "in": 1}[doc.units]
+    out.appids.new("GEOMETRIC_DRAWER")
+    for l in doc.layers.values():
+        layer = (
+            out.layers.get(l.name) if l.name in out.layers else out.layers.new(l.name)
+        )
+        layer.rgb = tuple(int(l.color[i : i + 2], 16) for i in (1, 3, 5))
+        layer.dxf.lineweight = min(
+            211, max(0, round(l.width * UNIT_MM[doc.units] * 100))
+        )
+        layer.lock() if l.locked else layer.unlock()
+        layer.on() if l.visible else layer.off()
+    msp = out.modelspace()
+    for e in doc.entities.values():
+        attrs, d, k = {"layer": e.layer}, e.data, e.kind
+        result = []
+        if k == "point":
+            result = [msp.add_point((e.x, e.y), dxfattribs=attrs)]
+        elif k == "line":
+            result = [msp.add_line(*e.vertices(), dxfattribs=attrs)]
+        elif k in ("polyline", "rectangle"):
+            result = [
+                msp.add_lwpolyline(
+                    e.vertices(),
+                    close=k == "rectangle" or d.get("closed", False),
+                    dxfattribs=attrs,
+                )
+            ]
+        elif k == "circle":
+            result = [msp.add_circle((e.x, e.y), d["radius"], dxfattribs=attrs)]
+        elif k == "arc":
+            if abs(d["sweep"]) >= 360 - EPS:
+                result = [msp.add_circle((e.x, e.y), d["radius"], dxfattribs=attrs)]
+            else:
+                start = e.angle + d["start"]
+                end = start + d["sweep"]
+                if d["sweep"] < 0:
+                    start, end = end, start
+                result = [
+                    msp.add_arc((e.x, e.y), d["radius"], start, end, dxfattribs=attrs)
+                ]
+        elif k == "ellipse":
+            rx, ry, orientation = d["rx"], d["ry"], e.angle
+            start, sweep = d.get("start", 0), d.get("sweep", 360)
+            if ry > rx:
+                rx, ry, orientation = ry, rx, orientation + 90
+                start -= 90
+            end = start + sweep
+            if sweep < 0:
+                start, end = end, start
+            result = [
+                msp.add_ellipse(
+                    (e.x, e.y),
+                    major_axis=polar(rx, orientation),
+                    ratio=ry / rx,
+                    start_param=math.radians(start),
+                    end_param=math.radians(end),
+                    dxfattribs=attrs,
+                )
+            ]
+        elif k == "bezier":
+            result = [msp.add_open_spline(e.vertices(), degree=3, dxfattribs=attrs)]
+        else:
+            for p in e.paths():
+                result.append(msp.add_lwpolyline(p, dxfattribs=attrs))
+        label = e.label()
+        if label:
+            (x, y), text, height = label
+            result.append(
+                msp.add_text(
+                    text,
+                    dxfattribs=dict(
+                        attrs, insert=(x, y), height=height, rotation=e.angle
+                    ),
+                )
             )
         if k == "region":
             try:
