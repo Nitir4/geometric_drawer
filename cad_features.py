@@ -1,3 +1,149 @@
+"""Derived drafting geometry: tangent connectors, rounds and planar cleanup."""
+
+import copy
+import itertools
+import math
+
+from scipy.optimize import least_squares
+
+try:
+    from .cad_curves import bezier_polynomials, simple_polyline
+    from .cad_geometry import (
+        EPS,
+        Entity,
+        add,
+        angle,
+        distance,
+        mul,
+        polar,
+        positive,
+        rotate,
+        sub,
+        unit,
+    )
+    from .cad_operations import intersections, on_curve
+except ImportError:
+    from cad_curves import bezier_polynomials, simple_polyline
+    from cad_geometry import (
+        EPS,
+        Entity,
+        add,
+        angle,
+        distance,
+        mul,
+        polar,
+        positive,
+        rotate,
+        sub,
+        unit,
+    )
+    from cad_operations import intersections, on_curve
+
+
+def parameter_curve(e):
+    """Return world position/velocity on normalized parameter [0,1]."""
+    if e.kind == "line":
+        a, b = e.vertices()
+        v = sub(b, a)
+        return lambda t: (add(a, mul(v, t)), v)
+    if e.kind == "bezier":
+        x, y = bezier_polynomials(e)
+        dx, dy = x.deriv(), y.deriv()
+        return lambda t: (e.world((x(t), y(t))), rotate((dx(t), dy(t)), e.angle))
+    if e.kind not in ("circle", "arc", "ellipse"):
+        raise ValueError(
+            "Contact requires a line, circle/arc, ellipse or cubic Bezier."
+        )
+    rx, ry = (
+        (e.data["rx"], e.data["ry"])
+        if e.kind == "ellipse"
+        else (e.data["radius"], e.data["radius"])
+    )
+    start, sweep = e.data.get("start", 0), e.data.get("sweep", 360)
+
+    def sample(t):
+        theta = math.radians(start + sweep * t)
+        p = rx * math.cos(theta), ry * math.sin(theta)
+        v = mul((-rx * math.sin(theta), ry * math.cos(theta)), math.radians(sweep))
+        return e.world(p), rotate(v, e.angle)
+
+    return sample
+
+
+def common_tangents(a, b, kind="both", allow_empty=False):
+    if (
+        a.kind not in ("circle", "arc")
+        or b.kind not in ("circle", "arc")
+        or kind not in ("both", "external", "internal")
+    ):
+        raise ValueError(
+            "Common tangents require two circles/arcs and both/external/internal mode."
+        )
+    c1, c2 = (a.x, a.y), (b.x, b.y)
+    separation = distance(c1, c2)
+    if separation <= EPS:
+        if allow_empty:
+            return []
+        raise ValueError("Concentric circles have no isolated common tangent segments.")
+    r1, r2 = a.data["radius"], b.data["radius"]
+    v = unit(sub(c2, c1))
+    result = []
+    for side in (1, -1):
+        if kind == "external" and side < 0 or kind == "internal" and side > 0:
+            continue
+        ratio = (r1 - side * r2) / separation
+        if abs(ratio) > 1:
+            continue
+        h = math.sqrt(max(0, (1 - ratio) * (1 + ratio)))
+        for orientation in (1, -1):
+            n = add(mul(v, ratio), mul(rotate(v, 90), orientation * h))
+            p, q = add(c1, mul(n, r1)), add(c2, mul(n, side * r2))
+            if (
+                distance(p, q) <= EPS
+                or not on_curve(a, p, 1e-7)
+                or not on_curve(b, q, 1e-7)
+            ):
+                continue
+            if not any(
+                distance(p, old[1]) <= EPS and distance(q, old[2]) <= EPS
+                for old in result
+            ):
+                result.append((f"{side}:{orientation}", p, q))
+    if not result:
+        raise ValueError(
+            "No nonzero common tangent segment lies on both selected curves."
+        )
+    return result
+
+
+def split_bezier(points, t):
+    levels = [list(points)]
+    for _ in range(3):
+        levels.append(
+            [add(mul(a, 1 - t), mul(b, t)) for a, b in itertools.pairwise(levels[-1])]
+        )
+    return [level[0] for level in levels], [level[-1] for level in levels[::-1]]
+
+
+def trim_contact(e, t, keep_first):
+    if e.kind == "line":
+        a, b = e.vertices()
+        q = add(a, mul(sub(b, a), t))
+        endpoints = (a, q) if keep_first else (q, b)
+        positive(distance(*endpoints))
+        e.x, e.y, e.angle = *endpoints[0], 0
+        e.data = {"points": [(0, 0), sub(endpoints[1], endpoints[0])]}
+    elif e.kind == "bezier":
+        if t <= EPS and keep_first or t >= 1 - EPS and not keep_first:
+            raise ValueError("Fillet would remove the entire Bezier leg.")
+        left, right = split_bezier(e.data["points"], t)
+        e.data["points"] = left if keep_first else right
+    elif e.kind in ("arc", "ellipse") and abs(e.data.get("sweep", 360)) < 360:
+        sweep = e.data["sweep"]
+        if not keep_first:
+            e.data["start"] += sweep * t
+        e.data["sweep"] = sweep * (t if keep_first else 1 - t)
+        positive(abs(e.data["sweep"]))
     # Closed circles/ellipses remain whole tangent reference boundaries.
     return e
 
