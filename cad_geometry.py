@@ -1,3 +1,82 @@
+"""Analytic 2-D geometry in drawing units; no Tk or file dependencies."""
+
+from __future__ import annotations
+
+import itertools
+import math
+from dataclasses import asdict, dataclass, field
+
+EPS = 1e-9
+KINDS = (
+    "point",
+    "line",
+    "polyline",
+    "region",
+    "rectangle",
+    "circle",
+    "arc",
+    "ellipse",
+    "bezier",
+    "text",
+    "dimension",
+    "radial_dimension",
+    "angular_dimension",
+)
+
+
+def finite(value):
+    value = float(value)
+    if not math.isfinite(value) or abs(value) > 1e12:
+        raise ValueError("Coordinates must be finite and at most 1e12 in magnitude.")
+    return value
+
+
+def positive(value):
+    value = finite(value)
+    if value <= EPS:
+        raise ValueError("Lengths and radii must be positive.")
+    return value
+
+
+def add(a, b):
+    return a[0] + b[0], a[1] + b[1]
+
+
+def sub(a, b):
+    return a[0] - b[0], a[1] - b[1]
+
+
+def mul(a, k):
+    return a[0] * k, a[1] * k
+
+
+def distance(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def unit(v):
+    return mul(v, 1 / positive(math.hypot(*v)))
+
+
+def rotate(p, degrees):
+    c, s = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+    return p[0] * c - p[1] * s, p[0] * s + p[1] * c
+
+
+def polar(radius, degrees):
+    return rotate((radius, 0), degrees)
+
+
+def angle(v):
+    return math.degrees(math.atan2(v[1], v[0]))
+
+
+def line_intersection(a, b, c, d):
+    r, s = sub(b, a), sub(d, c)
+    products = r[0] * s[1], r[1] * s[0]
+    den = math.fsum((products[0], -products[1]))
+    q = sub(c, a)
+    uncertainty = 32 * math.ulp(max(abs(v) for v in products))
     if abs(den) <= uncertainty:
         # Exact rational arithmetic on the represented binary inputs is cheap
         # for these few values, and avoids a fixed decimal precision assumption.
