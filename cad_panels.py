@@ -1,3 +1,99 @@
+"""GUI panels for reusable geometry and structured region hatch families."""
+
+import copy
+import tkinter as tk
+from tkinter import ttk
+
+try:
+    from .cad_geometry import Entity, add, rotate
+    from .cad_regions import definition, hatch_segments
+    from .cad_script import ScriptEngine
+except ImportError:
+    from cad_geometry import Entity, add, rotate
+    from cad_regions import definition, hatch_segments
+    from cad_script import ScriptEngine
+
+
+class DraftingPanels:
+    def scrollable_tab(self, title):
+        parent = ttk.Frame(self.tabs)
+        self.tabs.add(parent, text=title)
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.configure(yscrollcommand=bar.set)
+        body = ttk.Frame(canvas, padding=8)
+        window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind(
+            "<Configure>",
+            lambda event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>", lambda event: canvas.itemconfigure(window, width=event.width)
+        )
+        return parent, body
+
+    def build_drafting_panels(self):
+        self.assembly_tab, tab = self.scrollable_tab("Assemblies")
+        ttk.Label(tab, text="REUSABLE BLOCKS", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            tab,
+            text="Define selected geometry around a base point. Each insertion has its own pose and scale. Save edited definition geometry to update every instance.",
+            wraplength=310,
+        ).pack(fill="x", pady=6)
+        self.block_name = tk.StringVar()
+        self.block_box = ttk.Combobox(tab, textvariable=self.block_name)
+        self.block_box.pack(fill="x")
+        self.block_base_x = tk.StringVar(value="0")
+        self.block_base_y = tk.StringVar(value="0")
+        for label, var in (
+            ("Definition base X", self.block_base_x),
+            ("Definition base Y", self.block_base_y),
+        ):
+            ttk.Label(tab, text=label).pack(anchor="w")
+            ttk.Entry(tab, textvariable=var).pack(fill="x")
+        ttk.Button(
+            tab,
+            text="Define block from selection",
+            command=lambda: self.safe(self.block_define),
+        ).pack(fill="x", pady=4)
+        ttk.Button(
+            tab, text="Edit block geometry", command=lambda: self.safe(self.block_edit)
+        ).pack(fill="x")
+        ttk.Button(
+            tab,
+            text="Save definition geometry",
+            command=lambda: self.safe(self.block_save),
+        ).pack(fill="x", pady=4)
+        ttk.Button(
+            tab,
+            text="Remove block definition",
+            command=lambda: self.safe(self.block_remove),
+        ).pack(fill="x")
+        self.block_edit_ids = []
+        self.block_edit_name = None
+        self.block_edit_existing = set()
+        self.instance_id = tk.StringVar()
+        self.instance_box = ttk.Combobox(
+            tab, textvariable=self.instance_id, state="readonly"
+        )
+        self.instance_box.pack(fill="x", pady=(12, 4))
+        self.instance_box.bind("<<ComboboxSelected>>", self.instance_select)
+        self.instance_vars = {
+            k: tk.StringVar(value=v)
+            for k, v in (
+                ("x", "50"),
+                ("y", "0"),
+                ("angle", "0"),
+                ("scale", "1"),
+                ("layer", "0"),
+            )
+        }
+        for key, var in self.instance_vars.items():
+            ttk.Label(tab, text="Instance " + key).pack(anchor="w")
+            ttk.Entry(tab, textvariable=var).pack(fill="x")
+        self.instance_mirror = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             tab,
             text="Reflect definition in its local X axis",
