@@ -1,3 +1,110 @@
+"""Deterministic CAD commands with numeric expressions, not arbitrary eval/exec."""
+
+from __future__ import annotations
+
+import json
+import math
+import shlex
+
+try:
+    from .cad_geometry import positive
+except ImportError:
+    from cad_geometry import positive
+
+
+class ScriptError(ValueError):
+    pass
+
+
+class ScriptEngine:
+    def __init__(self, document):
+        self.doc = document
+        self.variables = {"pi": math.pi, "tau": math.tau}
+
+    def number(self, text):
+        try:
+            from .cad_parameters import CONSTANTS, evaluate
+        except ImportError:
+            from cad_parameters import CONSTANTS, evaluate
+        return evaluate(
+            str(text),
+            {
+                **CONSTANTS,
+                **self.doc.parameter_values(),
+                **{k: v for k, v in self.variables.items() if k not in CONSTANTS},
+            },
+        )
+
+    def execute(self, source, replace=False):
+        if len(source) > 1_000_000 or len(source.splitlines()) > 10000:
+            raise ScriptError("Script exceeds the size limit.")
+        old_variables = self.variables.copy()
+        try:
+            with self.doc.transaction("Run script"):
+                if replace:
+                    self.doc.entities.clear()
+                    self.doc.constraints.clear()
+                    self.doc.features.clear()
+                    self.doc.parameters.clear()
+                    self.doc.bindings.clear()
+                    self.doc.blocks.clear()
+                    self.doc.groups.clear()
+                    self.doc._feature_cache.clear()
+                    self.doc.layers = {"0": type(self.doc.layers["0"])("0")}
+                    self.doc.active_layer, self.doc.units = "0", "mm"
+                for lineno, line in enumerate(source.splitlines(), 1):
+                    try:
+                        tokens = shlex.split(line)
+                        if not tokens or tokens[0].startswith("#"):
+                            continue
+                        if "#" in tokens:
+                            tokens = tokens[: tokens.index("#")]
+                        self.command(tokens)
+                    except Exception as exc:
+                        raise ScriptError(f"Line {lineno}: {exc}") from exc
+        except Exception as exc:
+            self.variables = old_variables
+            if isinstance(exc, ScriptError):
+                raise
+            raise ScriptError(f"Line {locals().get('lineno', 0)}: {exc}") from exc
+        return len(self.doc.entities)
+
+    def command(self, tokens):
+        if tokens[0].upper() == "LET":
+            if len(tokens) != 2 or "=" not in tokens[1]:
+                raise ValueError(
+                    "Use LET name=expression; quote expressions containing spaces."
+                )
+            name, expression = tokens[1].split("=", 1)
+            if not name.isidentifier():
+                raise ValueError("Invalid variable name.")
+            self.variables[name] = self.number(expression)
+            return
+        cmd, positional, args = tokens[0].upper(), [], {}
+        for token in tokens[1:]:
+            if "=" in token:
+                k, v = token.split("=", 1)
+                if k.lower() in args:
+                    raise ValueError(f"Duplicate parameter {k}.")
+                args[k.lower()] = v
+            else:
+                positional.append(token)
+
+        def take(k, default=None, required=False):
+            if required and k not in args:
+                raise ValueError(f"Missing parameter {k}.")
+            return args.pop(k, default)
+
+        def num(k, default=0, required=False):
+            return self.number(take(k, default, required))
+
+        def boolean(k, default=False):
+            v = str(take(k, str(default))).lower()
+            if v not in ("true", "false", "1", "0"):
+                raise ValueError(f"{k} must be true or false.")
+            return v in ("true", "1")
+
+        def ids(n=1):
             if len(positional) != n:
                 raise ValueError(f"{cmd} requires {n} positional argument(s).")
             return positional
