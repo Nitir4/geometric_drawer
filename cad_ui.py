@@ -1,3 +1,443 @@
+            if name in self.doc.layers:
+                raise ValueError("Layer already exists.")
+            self.doc.set_layer(name)
+            self.doc.active_layer = name
+            self.layer_var.set(name)
+            self.changed("Layer created")
+
+    def color_layer(self):
+        l = self.doc.layers[self.layer_var.get()]
+        color = colorchooser.askcolor(l.color, parent=self.root)[1]
+        if color:
+            self.doc.set_layer(l.name, color=color)
+            self.changed()
+
+    def toggle_layer(self, prop):
+        l = self.doc.layers[self.layer_var.get()]
+        self.doc.set_layer(l.name, **{prop: not getattr(l, prop)})
+        self.changed()
+
+    def change_units(self):
+        self.doc.set_units(self.unit_var.get())
+        self.changed("Drawing units converted")
+        self.fit()
+
+    def run_script(self):
+        ScriptEngine(self.doc).execute(
+            self.editor.get("1.0", "end-1c"), replace=self.replace_script.get()
+        )
+        self.cancel()
+        self.changed("Script applied as one undoable edit")
+        if self.replace_script.get():
+            self.fit()
+
+    def drawing_to_code(self):
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", document_script(self.doc))
+        self.replace_script.set(True)
+        self.status.set("Current drawing captured as editable code")
+
+    def open_script(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("CAD script", "*.cad"), ("Text", "*.txt"), ("All files", "*")]
+        )
+        if path:
+            self.editor.delete("1.0", "end")
+            self.editor.insert("1.0", Path(path).read_text())
+
+    def save_script(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".cad", filetypes=[("CAD script", "*.cad")]
+        )
+        if path:
+            Path(path).write_text(self.editor.get("1.0", "end-1c"))
+
+    def confirm_discard(self):
+        if self.doc.snapshot() == self.saved_state:
+            return True
+        result = messagebox.askyesnocancel(
+            "Unsaved drawing", "Save the drawing before continuing?", parent=self.root
+        )
+        if result is None:
+            return False
+        return bool(self.save_file()) if result else True
+
+    def new_file(self):
+        if self.confirm_discard():
+            self.set_document(Document(), None, saved=True)
+
+    def set_document(self, doc, filename=None, saved=False):
+        self.cancel()
+        self.doc = doc
+        self.block_edit_ids = []
+        self.block_edit_name = None
+        self.block_edit_existing = set()
+        self.filename = filename
+        self.selection = []
+        self.saved_state = doc.snapshot() if saved else Document().snapshot()
+        self.layer_var.set(doc.active_layer)
+        self.changed("Drawing loaded")
+        self.fit()
+
+    def open_file(self):
+        if not self.confirm_discard():
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[("Geometric Drawer", "*.gdraw"), ("JSON", "*.json")]
+        )
+        if path:
+            self.safe(lambda: self.set_document(Document.load(path), path, saved=True))
+
+    def save_file(self, save_as=False):
+        path = self.filename
+        if save_as or not path:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".gdraw", filetypes=[("Geometric Drawer", "*.gdraw")]
+            )
+        if not path:
+            return False
+        try:
+            self.doc.save(path)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Save failed", str(exc), parent=self.root)
+            return False
+        self.filename = path
+        self.saved_state = self.doc.snapshot()
+        self.changed("Drawing saved")
+        return True
+
+    def open_dxf(self):
+        if not self.confirm_discard():
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ("CAD drawing", "*.dxf *.dwg"),
+                ("DXF", "*.dxf"),
+                ("DWG", "*.dwg"),
+            ]
+        )
+        if path:
+
+            def perform():
+                doc = (
+                    import_dwg(path)
+                    if Path(path).suffix.lower() == ".dwg"
+                    else import_dxf(path)
+                )
+                self.set_document(doc)
+                if getattr(doc, "import_warnings", []):
+                    messagebox.showinfo(
+                        "Import details",
+                        "\n".join(doc.import_warnings),
+                        parent=self.root,
+                    )
+
+            self.safe(perform)
+
+    def open_legacy(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Track script", "*.txt"), ("All files", "*")]
+        )
+        if path:
+
+            def perform_import():
+                import_legacy(self.doc, Path(path).read_text())
+                self.changed("Legacy track imported")
+                self.fit()
+
+            self.safe(perform_import)
+
+    def export(self, kind):
+        path = filedialog.asksaveasfilename(
+            defaultextension="." + kind, filetypes=[(kind.upper(), "*." + kind)]
+        )
+        if path:
+
+            def perform_export():
+                {
+                    "dxf": export_dxf,
+                    "dwg": export_dwg,
+                    "svg": export_svg,
+                    "pdf": export_pdf,
+                }[kind](self.doc, path)
+                self.status.set("Exported: " + path)
+
+            self.safe(perform_export)
+
+    def close(self):
+        if self.confirm_discard():
+            self.root.destroy()
+
+    def fit(self):
+        self.view.fit(
+            self.doc.bounds(), self.canvas.winfo_width(), self.canvas.winfo_height()
+        )
+        self.redraw()
+
+    def wheel(self, event):
+        up = getattr(event, "num", 0) == 4 or getattr(event, "delta", 0) > 0
+        self.view.zoom(1.2 if up else 1 / 1.2, event.x, event.y)
+        self.redraw()
+
+    def pan_start(self, e):
+        self.pan = (e.x, e.y, self.view.ox, self.view.oy)
+
+    def pan_motion(self, e):
+        if self.pan:
+            x, y, ox, oy = self.pan
+            self.view.ox, self.view.oy = ox + e.x - x, oy + e.y - y
+            self.redraw()
+
+    def snap_settings_changed(self):
+        self.snap_info.set("Snap: —")
+        self.redraw()
+
+    def snap(self, p, reference=None):
+        tolerance = 9 / self.view.scale
+        nearest, best = p, tolerance
+        kind = None
+        if self.object_snap.get():
+            perpendicular, tangent, nearest_enabled = (
+                self.perpendicular_snap.get(),
+                self.tangent_snap.get(),
+                self.nearest_snap.get(),
+            )
+            curves = []
+            for e in self.doc.entities.values():
+                if not self.doc.layers[e.layer].visible or e.id in self.preview:
+                    continue
+                if not self.extension_snap.get() and e.kind in (
+                    "point",
+                    "line",
+                    "polyline",
+                    "rectangle",
+                    "circle",
+                    "arc",
+                    "ellipse",
+                    "bezier",
+                ):
+                    x0, y0, x1, y1 = e.bounds()
+                    # Arc centres are valid object snaps outside the finite arc box.
+                    if e.kind == "arc":
+                        x0, y0, x1, y1 = (
+                            min(x0, e.x),
+                            min(y0, e.y),
+                            max(x1, e.x),
+                            max(y1, e.y),
+                        )
+                    if not (
+                        x0 - tolerance <= p[0] <= x1 + tolerance
+                        and y0 - tolerance <= p[1] <= y1 + tolerance
+                    ):
+                        continue
+                for q in e.snap_points():
+                    d = distance(p, q)
+                    if d < best:
+                        nearest, best = q, d
+                        kind = "Object"
+                for original_part in curve_parts(e):
+                    extension = (
+                        extension_part(original_part, p, tolerance)
+                        if self.extension_snap.get()
+                        else None
+                    )
+                    part = extension or original_part
+                    x0, y0, x1, y1 = part.bounds()
+                    if not (
+                        x0 - tolerance <= p[0] <= x1 + tolerance
+                        and y0 - tolerance <= p[1] <= y1 + tolerance
+                    ):
+                        continue
+                    if on_curve(part, p, tolerance):
+                        curves.append((part, extension is not None))
+                        if nearest_enabled or extension is not None:
+                            q = nearest_point(part, p)
+                            d = distance(p, q)
+                            if d < best:
+                                nearest, best, kind = (
+                                    q,
+                                    d,
+                                    "Extension" if extension is not None else "Nearest",
+                                )
+                        if reference is not None and (perpendicular or tangent):
+                            for q, mode in reference_points(
+                                part,
+                                reference,
+                                perpendicular=perpendicular,
+                                tangent=tangent,
+                            ):
+                                d = distance(p, q)
+                                if d < best:
+                                    nearest, best, kind = q, d, mode
+            for i, (a, extended_a) in enumerate(curves):
+                for b, extended_b in curves[i + 1 :]:
+                    for q in finite_intersections(a, b):
+                        d = distance(p, q)
+                        if d < best or kind == "Extension" and d < tolerance:
+                            nearest, best = q, d
+                            kind = (
+                                "Extension intersection"
+                                if extended_a or extended_b
+                                else "Intersection"
+                            )
+        if best == tolerance and self.grid_snap.get():
+            try:
+                spacing = positive(self.spacing.get())
+                nearest = tuple(round(v / spacing) * spacing for v in p)
+            except ValueError:
+                pass
+        if reference is not None and self.ortho.get() and kind is None:
+            dx, dy = sub(nearest, reference)
+            nearest = (
+                (nearest[0], reference[1])
+                if abs(dx) >= abs(dy)
+                else (reference[0], nearest[1])
+            )
+        self.snap_info.set("Snap: " + (kind or "—"))
+        return nearest
+
+    def hit(self, p):
+        tol = 7 / self.view.scale
+        candidates = []
+        for e in self.doc.entities.values():
+            if not self.doc.layers[e.layer].visible or self.doc.layers[e.layer].locked:
+                continue
+            x0, y0, x1, y1 = e.bounds()
+            if x0 - tol <= p[0] <= x1 + tol and y0 - tol <= p[1] <= y1 + tol:
+                d = e.hit_distance(p)
+                if d <= tol:
+                    candidates.append((d, e.id))
+        return min(candidates)[1] if candidates else None
+
+    def press(self, event):
+        self.canvas.focus_set()
+        self.safe(lambda: self._press(event))
+
+    def _press(self, event):
+        self.canvas.focus_set()
+        raw = self.view.world(event.x, event.y)
+        p = self.snap(raw, self.pending[-1] if self.pending else None)
+        if self.tool.get() != "Select":
+            if not self.doc.layers[self.doc.active_layer].visible:
+                raise ValueError("Choose a visible active layer to draw.")
+            self.pending.append(p)
+            self.hover = p
+            needed = {
+                "Point": 1,
+                "Text": 1,
+                "Line": 2,
+                "Rectangle": 2,
+                "Circle": 2,
+                "Ellipse": 2,
+                "Arc": 3,
+                "Dimension": 3,
+                "Radial dimension": 2,
+                "Angular dimension": 3,
+                "Bezier": 4,
+            }.get(self.tool.get())
+            if needed and len(self.pending) == needed:
+                try:
+                    self.create_from_points()
+                except Exception:
+                    self.pending.pop()
+                    raise
+            self.redraw()
+            return
+        block = self.selected_block()
+        if (
+            block
+            and distance(raw, self.block_rotation_handle(block)) < 8 / self.view.scale
+        ):
+            self.drag = {
+                "mode": "block_rotate",
+                "start": p,
+                "pivot": (block["params"]["x"], block["params"]["y"]),
+                "originals": {
+                    i: copy.deepcopy(self.doc.entities[i]) for i in block["outputs"]
+                },
+            }
+            return
+        if len(self.selection) == 1 and not block:
+            e = self.doc.entities[self.selection[0]]
+            if distance(raw, self.rotation_handle(e)) < 8 / self.view.scale:
+                self.drag = {
+                    "mode": "rotate",
+                    "start": p,
+                    "originals": {e.id: copy.deepcopy(e)},
+                }
+                return
+            for i, q in enumerate(e.handles()):
+                if distance(raw, q) < 8 / self.view.scale:
+                    self.drag = {
+                        "mode": "handle",
+                        "start": p,
+                        "handle": i,
+                        "originals": {e.id: copy.deepcopy(e)},
+                    }
+                    return
+        id = self.hit(raw)
+        if id:
+            picked = self.doc.expand_selection([id])
+            if event.state & 1:
+                if id in self.selection:
+                    self.selection = [i for i in self.selection if i not in picked]
+                else:
+                    self.selection.extend(picked)
+            elif id not in self.selection:
+                self.selection = picked
+            self.selection = self.doc.expand_selection(self.selection)
+            self.drag = {
+                "mode": "move",
+                "start": p,
+                "originals": {
+                    i: copy.deepcopy(self.doc.entities[i]) for i in self.selection
+                },
+            }
+            self.changed()
+        else:
+            if not event.state & 1:
+                self.selection = []
+            self.drag = {"mode": "window", "start": raw, "end": raw, "originals": {}}
+            self.changed()
+
+    def motion(self, event):
+        raw = self.view.world(event.x, event.y)
+        p = self.snap(raw, self.pending[-1] if self.pending else None)
+        self.hover = p
+        self.coords.set(f"X {p[0]:.3f}  Y {p[1]:.3f} {self.doc.units}")
+        if self.drag:
+            if self.drag["mode"] == "window":
+                self.drag["end"] = raw
+            else:
+                delta = sub(p, self.drag["start"])
+                preview = copy.deepcopy(self.drag["originals"])
+                try:
+                    for e in preview.values():
+                        if self.drag["mode"] == "move":
+                            e.x, e.y = add((e.x, e.y), delta)
+                            if e.data.get("ref") not in self.drag["originals"]:
+                                e.data.pop("ref", None)
+                        elif self.drag["mode"] == "block_rotate":
+                            pivot = self.drag["pivot"]
+                            turn = angle(sub(p, pivot)) - angle(
+                                sub(self.drag["start"], pivot)
+                            )
+                            e.x, e.y = add(pivot, rotate(sub((e.x, e.y), pivot), turn))
+                            e.angle += turn
+                        elif self.drag["mode"] == "rotate":
+                            pivot = (e.x, e.y)
+                            e.angle += angle(sub(p, pivot)) - angle(
+                                sub(self.drag["start"], pivot)
+                            )
+                            e.data.pop("ref", None)
+                        else:
+                            self.edit_handle(e, self.drag["handle"], p)
+                        e.validate()
+                    self.preview = preview
+                except ValueError as exc:
+                    self.preview = {}
+                    self.status.set(str(exc))
+        self.redraw()
 
     @staticmethod
     def edit_handle(e, index, p):
