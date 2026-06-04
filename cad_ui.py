@@ -1,3 +1,443 @@
+        self.changed("Driving value updated; sketch solved")
+
+    def constraint_remove(self):
+        ids = self.constraint_tree.selection()
+        if not ids:
+            raise ValueError("Select a constraint first.")
+        self.doc.remove_constraint(ids[0])
+        self.changed("Constraint removed")
+
+    def safe(self, fn):
+        try:
+            return fn()
+        except (ValueError, KeyError, OSError, TypeError, ArithmeticError) as exc:
+            self.status.set(str(exc))
+            messagebox.showerror(
+                "Cannot complete operation", str(exc), parent=self.root
+            )
+
+    def changed(self, message=None):
+        self.doc.refresh_dimensions()
+        self.refresh_parameters()
+        self.assembly_refresh()
+        self.feature_box.configure(values=list(self.doc.features))
+        if self.feature_target.get() not in self.doc.features:
+            self.feature_target.set("")
+        selected_constraints = self.constraint_tree.selection()
+        self.constraint_tree.delete(*self.constraint_tree.get_children())
+        for c in self.doc.constraints.values():
+            self.constraint_tree.insert(
+                "",
+                "end",
+                iid=c["id"],
+                text=c["id"],
+                values=(c["kind"] + " " + ",".join(c["refs"]), c.get("value", "")),
+            )
+        self.constraint_tree.selection_set(
+            [id for id in selected_constraints if id in self.doc.constraints]
+        )
+        if self.doc.constraints or self.doc.bindings:
+            report = self.doc.constraint_report()
+            self.constraint_info.set(
+                f"{report['constraints']} constraints · {report['dof']} local degrees of freedom\nResidual {report['max_residual']:.2g}"
+            )
+        else:
+            self.constraint_info.set("No constraints")
+        self.selection = [
+            i
+            for i in self.selection
+            if i in self.doc.entities
+            and not self.doc.layers[self.doc.entities[i].layer].locked
+            and self.doc.layers[self.doc.entities[i].layer].visible
+        ]
+        self._syncing_tree = True
+        self.tree.delete(*self.tree.get_children())
+        for e in self.doc.entities.values():
+            layer = self.doc.layers[e.layer]
+            self.tree.insert(
+                "",
+                "end",
+                iid=e.id,
+                text=e.id,
+                values=(e.kind,),
+                tags=("locked" if layer.locked or not layer.visible else "normal",),
+            )
+        self.tree.tag_configure("locked", foreground="#999999")
+        self.tree.selection_set(self.selection)
+        self._syncing_tree = False
+        self.unit_var.set(self.doc.units)
+        self.layer_box.configure(values=list(self.doc.layers))
+        if self.layer_var.get() not in self.doc.layers:
+            self.layer_var.set(self.doc.active_layer)
+        l = self.doc.layers[self.layer_var.get()]
+        self.layer_info.set(
+            f"{l.color} · {l.width:g} {self.doc.units}\n"
+            + ("Visible" if l.visible else "Hidden")
+            + " · "
+            + ("Locked" if l.locked else "Unlocked")
+        )
+        self.update_selection()
+        name = Path(self.filename).name if self.filename else "Untitled"
+        dirty = self.doc.snapshot() != self.saved_state
+        self.root.title(f"{'● ' if dirty else ''}{name} · Geometric Drawer · 2-D CAD")
+        if message:
+            if self.doc.topology_events:
+                created = sum(len(e["created"]) for e in self.doc.topology_events)
+                retired = sum(len(e["retired"]) for e in self.doc.topology_events)
+                message += f" · topology: {created} new, {retired} retired components"
+            self.status.set(message)
+        self.redraw()
+
+    def property_form(self, e=None):
+        for child in self.prop_frame.winfo_children():
+            child.destroy()
+        k = self.kind_var.get()
+        values = {
+            "id": "",
+            "x": "0",
+            "y": "0",
+            "orientation": "0",
+            "layer": self.doc.active_layer,
+            "construction": "false",
+        }
+        values.update(DEFAULTS[k])
+        if e:
+            values.update(
+                id=e.id,
+                x=f"{e.x:.12g}",
+                y=f"{e.y:.12g}",
+                orientation=f"{e.angle:.12g}",
+                layer=e.layer,
+                construction=str(e.construction).lower(),
+            )
+            for key in DEFAULTS[k]:
+                value = e.data.get(key, DEFAULTS[k][key])
+                if key == "rings":
+                    value = json.dumps(value)
+                if key == "points":
+                    value = ";".join(",".join(f"{v:.12g}" for v in p) for p in value)
+                values[key] = (
+                    str(value).lower() if isinstance(value, bool) else str(value)
+                )
+            if k == "line":
+                a, b = e.vertices()
+                values.update(
+                    x=f"{a[0]:.12g}",
+                    y=f"{a[1]:.12g}",
+                    orientation=f"{angle(sub(b, a)):.12g}",
+                    length=f"{distance(a, b):.12g}",
+                )
+        self.props = {}
+        for i, (key, val) in enumerate(values.items()):
+            ttk.Label(self.prop_frame, text=key).grid(
+                row=i, column=0, sticky="w", padx=(0, 6), pady=2
+            )
+            var = tk.StringVar(value=val)
+            self.props[key] = var
+            if key in ("construction", "closed", "fill"):
+                widget = ttk.Combobox(
+                    self.prop_frame,
+                    textvariable=var,
+                    values=("false", "true"),
+                    state="readonly",
+                    width=22,
+                )
+            elif key == "layer":
+                widget = ttk.Combobox(
+                    self.prop_frame,
+                    textvariable=var,
+                    values=list(self.doc.layers),
+                    state="readonly",
+                    width=22,
+                )
+            else:
+                widget = ttk.Entry(self.prop_frame, textvariable=var, width=25)
+            widget.grid(row=i, column=1, sticky="ew", pady=2)
+        self.prop_frame.columnconfigure(1, weight=1)
+
+    def read_properties(self, existing=None):
+        v = {k: value.get() for k, value in self.props.items()}
+        engine = ScriptEngine(self.doc)
+        n = engine.number
+        id = v.pop("id") or self.doc.unique_id(self.kind_var.get())
+        if existing and id != existing.id:
+            raise ValueError(
+                "Entity IDs stay fixed; use Copy to create another entity."
+            )
+        k = self.kind_var.get()
+        common = {
+            "id": id,
+            "kind": k,
+            "x": n(v.pop("x")),
+            "y": n(v.pop("y")),
+            "angle": n(v.pop("orientation")),
+            "layer": v.pop("layer"),
+            "construction": v.pop("construction") == "true",
+        }
+        data = copy.deepcopy(existing.data) if existing and k == existing.kind else {}
+        if existing and "block_edit_key" in existing.data:
+            data["block_edit_key"] = existing.data["block_edit_key"]
+        for key, val in v.items():
+            if key in ("text", "hatch"):
+                data[key] = val
+            elif key == "rings":
+                data[key] = json.loads(val)
+            elif key == "points":
+                data[key] = [tuple(n(x) for x in p.split(",")) for p in val.split(";")]
+            elif key in ("closed", "fill"):
+                data[key] = val == "true"
+            elif key == "length" and k == "line":
+                data["points"] = [(0, 0), (positive(n(val)), 0)]
+            else:
+                data[key] = n(val)
+        return Entity(**common, data=data).validate()
+
+    def create_properties(self):
+        e = self.read_properties()
+        if e.id in self.doc.entities:
+            e.id = self.doc.unique_id(e.kind)
+        id = self.doc.add(
+            e.kind,
+            id=e.id,
+            x=e.x,
+            y=e.y,
+            angle=e.angle,
+            layer=e.layer,
+            construction=e.construction,
+            **e.data,
+        )
+        self.selection = [id]
+        self.changed("Created " + id)
+
+    def apply_properties(self):
+        if len(self.selection) != 1:
+            raise ValueError("Select exactly one entity to edit properties.")
+        old = self.doc.entities[self.selection[0]]
+        e = self.read_properties(old)
+        # Independent geometry edits freeze an annotation; offset-only edits stay associative.
+        if e.data.get("ref") and (
+            e.x,
+            e.y,
+            e.angle,
+            e.data.get("points"),
+            e.data.get("radius"),
+        ) != (
+            old.x,
+            old.y,
+            old.angle,
+            old.data.get("points"),
+            old.data.get("radius"),
+        ):
+            e.data.pop("ref")
+        self.doc.replace(e)
+        self.changed("Properties applied")
+
+    def update_selection(self):
+        self.selection_info.set(
+            ", ".join(self.selection) if self.selection else "No selection"
+        )
+        if len(self.selection) == 1:
+            e = self.doc.entities[self.selection[0]]
+            f = self.doc.feature_for(e.id)
+            if not f:
+                self.feature_target.set("")
+            if f:
+                self.feature_target.set(f["id"])
+                self.selection_info.set(
+                    f"{e.id} · Linked {f['kind']} ({f['id']})\nSources: {', '.join(f['sources'])}\nEdit via Select sources or Update feature; Detach for independent edits."
+                )
+            self.kind_var.set(e.kind)
+            self.property_form(e)
+
+    def tree_select(self, event=None):
+        if getattr(self, "_syncing_tree", False):
+            return
+        ids = [
+            i
+            for i in self.tree.selection()
+            if self.doc.layers[self.doc.entities[i].layer].visible
+            and not self.doc.layers[self.doc.entities[i].layer].locked
+        ]
+        if ids == self.selection:
+            return
+        self.selection = self.doc.expand_selection(ids)
+        self.update_selection()
+        self.redraw()
+
+    def select_all(self):
+        self.selection = [
+            e.id
+            for e in self.doc.entities.values()
+            if self.doc.layers[e.layer].visible and not self.doc.layers[e.layer].locked
+        ]
+        self.changed()
+
+    def modify(self, op):
+        feature_op = op in ("Detach", "Select sources", "Update feature")
+        if not self.selection and not (feature_op and self.feature_target.get()):
+            raise ValueError("Select geometry or a feature ID first.")
+        target = (
+            self.feature_target.get()
+            if feature_op and self.feature_target.get()
+            else self.selection[0]
+        )
+        v = {
+            k: ScriptEngine(self.doc).number(x.get())
+            for k, x in self.transform_vars.items()
+        }
+        pivot = v["pivot x"], v["pivot y"]
+        if op in ("Move", "Copy", "Rotate", "Scale"):
+            self.selection = self.doc.transform(
+                self.selection,
+                dx=v["dx"] if op in ("Move", "Copy") else 0,
+                dy=v["dy"] if op in ("Move", "Copy") else 0,
+                rotation=v["rotation"] if op == "Rotate" else 0,
+                scale=v["factor"] if op == "Scale" else 1,
+                pivot=pivot,
+                copy_entities=op == "Copy",
+            )
+        elif op == "Mirror":
+            self.selection = self.doc.mirror(
+                self.selection, pivot, add(pivot, polar(1, v["rotation"]))
+            )
+        elif op == "Array":
+            self.selection += self.doc.array(
+                self.selection[:], v["count"], v["dx"], v["dy"], v["rotation"], pivot
+            )
+        elif op == "Detach":
+            self.selection = self.doc.detach_feature(target)
+        elif op == "Select sources":
+            f = self.doc.feature_for(target)
+            if f is None:
+                raise ValueError("Select a linked output.")
+            self.selection = list(f["sources"])
+        elif op == "Update feature":
+            f = self.doc.feature_for(target)
+            if f is None:
+                raise ValueError("Select a linked output.")
+            params = {}
+            for key in ("amount", "radius"):
+                if key in f["params"]:
+                    params[key] = v["amount"]
+            if "tolerance" in f["params"]:
+                params["tolerance"] = v["curve tol"]
+            if "join" in f["params"]:
+                params["join"] = self.cleanup_join.get()
+            if "as_regions" in f["params"]:
+                params["as_regions"] = self.cleanup_regions.get()
+            self.doc.update_feature(f["id"], **params)
+            self.selection = list(f["outputs"])
+        elif op in ("Round path", "Clean offset"):
+            if len(self.selection) != 1:
+                raise ValueError("Select one path.")
+            if op == "Round path":
+                self.selection = [
+                    self.doc.round_path(
+                        self.selection[0],
+                        v["amount"],
+                        tolerance=v["curve tol"],
+                        linked=self.linked_features.get(),
+                    )
+                ]
+            else:
+                self.selection = self.doc.clean_offset(
+                    self.selection[0],
+                    v["amount"],
+                    tolerance=v["curve tol"],
+                    join=self.cleanup_join.get(),
+                    as_regions=self.cleanup_regions.get(),
+                    linked=self.linked_features.get(),
+                )
+        elif op == "Tangents":
+            if len(self.selection) != 2:
+                raise ValueError("Select two circles/arcs.")
+            self.selection = self.doc.common_tangents(
+                *self.selection, linked=self.linked_features.get()
+            )
+        elif op in ("Union", "Difference", "Intersection"):
+            if len(self.selection) < 2:
+                raise ValueError(
+                    "Select at least two closed shapes; Difference subtracts later selections from the first."
+                )
+            self.selection = self.doc.boolean(
+                self.selection,
+                op.lower(),
+                tolerance=v["curve tol"],
+                linked=self.linked_features.get(),
+            )
+        elif op == "Offset":
+            if len(self.selection) != 1:
+                raise ValueError("Select one supported edge or curve.")
+            self.selection = [
+                self.doc.offset(
+                    self.selection[0],
+                    v["amount"],
+                    tolerance=v["curve tol"],
+                    linked=self.linked_features.get(),
+                )
+            ]
+        else:
+            if len(self.selection) != 2:
+                raise ValueError("Select target and cutter in that order.")
+            if op in ("Trim", "Extend"):
+                self.selection = self.doc.trim_extend(
+                    *self.selection, pivot, op == "Extend", tolerance=v["curve tol"]
+                )
+            else:
+                connector = self.doc.corner(
+                    *self.selection,
+                    v["amount"],
+                    fillet=op == "Fillet",
+                    pick=pivot,
+                    linked=self.linked_features.get(),
+                )
+                if connector and self.linked_features.get():
+                    self.selection = [connector]
+        result = self.doc.entities[self.selection[0]] if self.selection else None
+        info = (
+            result.data.get("offset_approximation")
+            if result is not None and op == "Offset"
+            else None
+        )
+        self.changed(
+            f"Offset: {len(result.data['points'])} polyline vertices; tolerance {info['tolerance']:g} {self.doc.units}"
+            if info
+            else op + " completed"
+        )
+
+    def dimension_selection(self):
+        if not self.selection:
+            raise ValueError("Select a line, circle or arc.")
+        with self.doc.transaction("Dimension selection"):
+            ids = [self.doc.dimension(i) for i in self.selection]
+        self.selection = ids
+        self.changed("Associative dimensions created")
+
+    def delete(self):
+        self.doc.delete(self.selection)
+        self.selection = []
+        self.cancel()
+        self.changed("Deleted selection")
+
+    def undo(self):
+        self.cancel()
+        label = self.doc.undo()
+        self.changed("Undo " + label if label else "Nothing to undo")
+
+    def redo(self):
+        self.cancel()
+        label = self.doc.redo()
+        self.changed("Redo " + label if label else "Nothing to redo")
+
+    def choose_layer(self):
+        name = self.layer_var.get()
+        if not self.doc.layers[name].locked:
+            self.doc.active_layer = name
+        self.changed()
+
+    def new_layer(self):
+        name = simpledialog.askstring("New layer", "Layer name:", parent=self.root)
+        if name:
             if name in self.doc.layers:
                 raise ValueError("Layer already exists.")
             self.doc.set_layer(name)
