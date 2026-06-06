@@ -1,3 +1,443 @@
+                "Move",
+                "Copy",
+                "Rotate",
+                "Scale",
+                "Mirror",
+                "Offset",
+                "Array",
+                "Trim",
+                "Extend",
+                "Fillet",
+                "Chamfer",
+                "Round path",
+                "Tangents",
+                "Clean offset",
+                "Union",
+                "Difference",
+                "Intersection",
+                "Detach",
+                "Update feature",
+                "Select sources",
+            )
+        ):
+            ttk.Button(
+                buttons,
+                text=op,
+                command=lambda name=op: self.safe(lambda: self.modify(name)),
+            ).grid(row=i // 3, column=i % 3, sticky="ew", padx=1, pady=2)
+        for i in range(3):
+            buttons.columnconfigure(i, weight=1)
+        ttk.Label(
+            properties,
+            text="Pivot picks the trim end or crossing corner.\nCurve tol bounds ellipse/Bezier offset chord error, in drawing units.",
+            wraplength=300,
+        ).pack(anchor="w", pady=7)
+
+        bar = ttk.Frame(code)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Run", command=lambda: self.safe(self.run_script)).pack(
+            side="left"
+        )
+        ttk.Checkbutton(bar, text="Replace drawing", variable=self.replace_script).pack(
+            side="left", padx=4
+        )
+        self.editor = tk.Text(
+            code, width=36, wrap="none", undo=True, font="TkFixedFont"
+        )
+        self.editor.pack(fill="both", expand=True, pady=5)
+        sx = ttk.Scrollbar(code, orient="horizontal", command=self.editor.xview)
+        sx.pack(fill="x")
+        self.editor.configure(xscrollcommand=sx.set)
+        bottom = ttk.Frame(code)
+        bottom.pack(fill="x", pady=4)
+        for title, fn in [
+            ("Drawing → code", self.drawing_to_code),
+            ("Open…", self.open_script),
+            ("Save…", self.save_script),
+        ]:
+            ttk.Button(bottom, text=title, command=lambda f=fn: self.safe(f)).pack(
+                side="left", padx=1
+            )
+        guide = tk.Text(
+            self.help_tab,
+            wrap="word",
+            width=40,
+            font="TkDefaultFont",
+            padx=10,
+            pady=10,
+        )
+        guide.insert("1.0", HELP)
+        guide.configure(state="disabled")
+        guide.pack(fill="both", expand=True)
+        bottom = ttk.Frame(self.root, padding=(10, 3))
+        bottom.pack(fill="x")
+        ttk.Label(bottom, textvariable=self.status).pack(side="left")
+        ttk.Label(bottom, textvariable=self.coords).pack(side="right")
+
+    def build_constraint_panel(self):
+        try:
+            from .cad_constraints import KINDS as CONSTRAINT_KINDS
+        except ImportError:
+            from cad_constraints import KINDS as CONSTRAINT_KINDS
+        self.build_parameter_tab()
+        self.constraint_tab = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(self.constraint_tab, text="Constraints")
+        tab = self.constraint_tab
+        ttk.Label(tab, text="DRIVING SKETCH CONSTRAINTS", style="Title.TLabel").pack(
+            anchor="w"
+        )
+        ttk.Label(
+            tab,
+            text="References: IDs or ID@index for vertices. Arc @0 is centre, @1 start, @2 end. Symmetry uses two points then a line. Separate references with commas.",
+            wraplength=310,
+        ).pack(fill="x", pady=8)
+        self.constraint_kind = tk.StringVar(value="length")
+        self.constraint_refs = tk.StringVar()
+        self.constraint_value = tk.StringVar(value="40")
+        self.constraint_parameters = tk.StringVar(value="0.5,0.5")
+        ttk.Combobox(
+            tab,
+            textvariable=self.constraint_kind,
+            values=CONSTRAINT_KINDS,
+            state="readonly",
+        ).pack(fill="x", pady=4)
+        ttk.Label(tab, text="References").pack(anchor="w")
+        ttk.Entry(tab, textvariable=self.constraint_refs).pack(fill="x")
+        ttk.Button(
+            tab, text="Use selected entities", command=self.constraint_use_selection
+        ).pack(fill="x", pady=4)
+        ttk.Label(tab, text="Value (drawing units, or degrees for angle)").pack(
+            anchor="w"
+        )
+        ttk.Entry(tab, textvariable=self.constraint_value).pack(fill="x")
+        ttk.Label(tab, text="Curve tangent contact parameters (0..1), t1,t2").pack(
+            anchor="w"
+        )
+        ttk.Entry(tab, textvariable=self.constraint_parameters).pack(fill="x")
+        ttk.Button(
+            tab, text="Add constraint", command=lambda: self.safe(self.constraint_add)
+        ).pack(fill="x", pady=6)
+        self.constraint_tree = ttk.Treeview(
+            tab,
+            columns=("rule", "value"),
+            show="tree headings",
+            height=10,
+            selectmode="browse",
+        )
+        self.constraint_tree.heading("#0", text="ID")
+        self.constraint_tree.column("#0", width=75, stretch=False)
+        self.constraint_tree.heading("rule", text="Rule / references")
+        self.constraint_tree.column("rule", width=160)
+        self.constraint_tree.heading("value", text="Value")
+        self.constraint_tree.column("value", width=65, stretch=False)
+        self.constraint_tree.pack(fill="both", expand=True)
+        self.constraint_tree.bind("<<TreeviewSelect>>", self.constraint_select)
+        ttk.Button(
+            tab,
+            text="Update driving value",
+            command=lambda: self.safe(self.constraint_drive),
+        ).pack(fill="x", pady=4)
+        ttk.Button(
+            tab,
+            text="Remove constraint",
+            command=lambda: self.safe(self.constraint_remove),
+        ).pack(fill="x")
+        self.constraint_info = tk.StringVar(value="No constraints")
+        ttk.Label(tab, textvariable=self.constraint_info, wraplength=310).pack(
+            fill="x", pady=8
+        )
+        ttk.Label(
+            tab,
+            text="Manual and numeric edits are solved against these rules. To resize a driven sketch, update its driving value. Conflicts roll back the whole edit. Copies start unconstrained.",
+            wraplength=310,
+        ).pack(fill="x")
+
+    def build_parameter_tab(self):
+        self.parameter_tab = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(self.parameter_tab, text="Parameters")
+        scroll = tk.Canvas(self.parameter_tab, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(
+            self.parameter_tab, orient="vertical", command=scroll.yview
+        )
+        scrollbar.pack(side="right", fill="y")
+        scroll.pack(side="left", fill="both", expand=True)
+        scroll.configure(yscrollcommand=scrollbar.set)
+        tab = ttk.Frame(scroll, padding=4)
+        window = scroll.create_window((0, 0), window=tab, anchor="nw")
+        tab.bind(
+            "<Configure>",
+            lambda event: scroll.configure(scrollregion=scroll.bbox("all")),
+        )
+        scroll.bind(
+            "<Configure>", lambda event: scroll.itemconfigure(window, width=event.width)
+        )
+        ttk.Label(tab, text="PERSISTENT DESIGN PARAMETERS", style="Title.TLabel").pack(
+            anchor="w"
+        )
+        ttk.Label(
+            tab,
+            text="Expressions follow named dependencies. Lengths keep their declaration units; angles use degrees. Trig functions take radians.",
+            wraplength=310,
+        ).pack(fill="x", pady=6)
+        self.parameter_name = tk.StringVar()
+        self.parameter_expression = tk.StringVar(value="20")
+        self.parameter_kind = tk.StringVar(value="length")
+        self.parameter_units = tk.StringVar(value=self.doc.units)
+        for label, variable in (
+            ("Name", self.parameter_name),
+            ("Expression", self.parameter_expression),
+        ):
+            ttk.Label(tab, text=label).pack(anchor="w")
+            ttk.Entry(tab, textvariable=variable).pack(fill="x")
+        ttk.Combobox(
+            tab,
+            textvariable=self.parameter_kind,
+            values=("length", "angle", "scalar"),
+            state="readonly",
+        ).pack(fill="x", pady=4)
+        ttk.Label(tab, text="Expression length units").pack(anchor="w")
+        ttk.Combobox(
+            tab,
+            textvariable=self.parameter_units,
+            values=("mm", "cm", "m", "in"),
+            state="readonly",
+        ).pack(fill="x", pady=4)
+        ttk.Button(
+            tab, text="Set parameter", command=lambda: self.safe(self.parameter_set)
+        ).pack(fill="x")
+        self.parameter_tree = ttk.Treeview(
+            tab,
+            columns=("expression", "value"),
+            show="tree headings",
+            height=5,
+            selectmode="browse",
+        )
+        for key, label, width in (
+            ("#0", "Name", 85),
+            ("expression", "Expression", 135),
+            ("value", "Value", 75),
+        ):
+            self.parameter_tree.heading(key, text=label)
+            self.parameter_tree.column(key, width=width)
+        self.parameter_tree.pack(fill="x", pady=6)
+        self.parameter_tree.bind("<<TreeviewSelect>>", self.parameter_select)
+        ttk.Button(
+            tab,
+            text="Remove parameter",
+            command=lambda: self.safe(self.parameter_remove),
+        ).pack(fill="x")
+        self.binding_target = tk.StringVar(value="entity")
+        self.binding_id = tk.StringVar()
+        self.binding_property = tk.StringVar(value="radius")
+        self.binding_expression = tk.StringVar()
+        self.binding_units = tk.StringVar(value=self.doc.units)
+        ttk.Label(tab, text="EXPRESSION DRIVERS", style="Title.TLabel").pack(
+            anchor="w", pady=(12, 4)
+        )
+        ttk.Combobox(
+            tab,
+            textvariable=self.binding_target,
+            values=("entity", "constraint", "feature"),
+            state="readonly",
+        ).pack(fill="x")
+        for label, variable in (
+            ("Target ID", self.binding_id),
+            ("Property (e.g. radius, v0.x, value, amount)", self.binding_property),
+            ("Expression", self.binding_expression),
+        ):
+            ttk.Label(tab, text=label).pack(anchor="w")
+            ttk.Entry(tab, textvariable=variable).pack(fill="x")
+        ttk.Label(tab, text="Driver expression length units").pack(anchor="w")
+        ttk.Combobox(
+            tab,
+            textvariable=self.binding_units,
+            values=("mm", "cm", "m", "in"),
+            state="readonly",
+        ).pack(fill="x", pady=4)
+        ttk.Button(
+            tab, text="Use selected target", command=self.binding_use_selection
+        ).pack(fill="x", pady=4)
+        ttk.Button(
+            tab, text="Bind expression", command=lambda: self.safe(self.binding_set)
+        ).pack(fill="x")
+        self.binding_tree = ttk.Treeview(
+            tab,
+            columns=("expression",),
+            show="tree headings",
+            height=5,
+            selectmode="browse",
+        )
+        self.binding_tree.heading("#0", text="Target / property")
+        self.binding_tree.heading("expression", text="Expression")
+        self.binding_tree.column("#0", width=170)
+        self.binding_tree.column("expression", width=125)
+        self.binding_tree.pack(fill="both", expand=True, pady=6)
+        self.binding_tree.bind("<<TreeviewSelect>>", self.binding_select)
+        ttk.Button(
+            tab,
+            text="Unbind expression",
+            command=lambda: self.safe(self.binding_remove),
+        ).pack(fill="x")
+        ttk.Label(
+            tab,
+            text="Drivers are enforced during manual and numeric edits. Change the parameter or unbind to edit a driven property. Unit changes preserve the physical design.",
+            wraplength=310,
+        ).pack(fill="x", pady=8)
+
+    def parameter_select(self, event=None):
+        ids = self.parameter_tree.selection()
+        if ids and ids[0] in self.doc.parameters:
+            name = ids[0]
+            spec = self.doc.parameters[name]
+            self.parameter_name.set(name)
+            self.parameter_expression.set(spec["expression"])
+            self.parameter_kind.set(spec["kind"])
+            self.parameter_units.set(spec["units"])
+
+    def parameter_set(self):
+        name = self.parameter_name.get().strip()
+        # The visible unit selector makes the expression convention explicit.
+        units = self.parameter_units.get()
+        self.doc.set_parameter(
+            name,
+            self.parameter_expression.get(),
+            self.parameter_kind.get(),
+            units=units,
+        )
+        self.changed("Parameter updated; geometry regenerated")
+
+    def parameter_remove(self):
+        self.doc.remove_parameter(self.parameter_name.get().strip())
+        self.changed("Parameter removed")
+
+    def binding_use_selection(self):
+        target = self.binding_target.get()
+        if target == "entity" and self.selection:
+            self.binding_id.set(self.selection[0])
+        elif target == "constraint" and self.constraint_tree.selection():
+            self.binding_id.set(self.constraint_tree.selection()[0])
+        elif target == "feature":
+            self.binding_id.set(self.feature_target.get())
+
+    def binding_set(self):
+        self.doc.bind(
+            self.binding_id.get().strip(),
+            self.binding_property.get().strip(),
+            self.binding_expression.get(),
+            target=self.binding_target.get(),
+            units=self.binding_units.get(),
+        )
+        self.changed("Expression bound; geometry regenerated")
+
+    def binding_remove(self):
+        self.doc.unbind(
+            self.binding_id.get().strip(),
+            self.binding_property.get().strip(),
+            target=self.binding_target.get(),
+        )
+        self.changed("Expression unbound")
+
+    def binding_select(self, event=None):
+        ids = self.binding_tree.selection()
+        if ids:
+            b = self.doc.bindings[int(ids[0])]
+            self.binding_target.set(b["target"])
+            self.binding_id.set(b["id"])
+            self.binding_property.set(b["property"])
+            self.binding_expression.set(b["expression"])
+            self.binding_units.set(b["units"])
+
+    def refresh_parameters(self):
+        selected = self.parameter_tree.selection()
+        self.parameter_tree.delete(*self.parameter_tree.get_children())
+        values = self.doc.parameter_values()
+        for name, spec in self.doc.parameters.items():
+            self.parameter_tree.insert(
+                "",
+                "end",
+                iid=name,
+                text=name,
+                values=(
+                    spec["expression"],
+                    f"{values[name]:g} {self.doc.units if spec['kind'] == 'length' else spec['kind']}",
+                ),
+            )
+        self.parameter_tree.selection_set(
+            [n for n in selected if n in self.doc.parameters]
+        )
+        self.binding_tree.delete(*self.binding_tree.get_children())
+        for i, b in enumerate(self.doc.bindings):
+            self.binding_tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                text=f"{b['target']}:{b['id']}.{b['property']}",
+                values=(b["expression"],),
+            )
+
+    def constraint_use_selection(self):
+        self.constraint_refs.set(",".join(self.selection))
+
+    def constraint_select(self, event=None):
+        ids = self.constraint_tree.selection()
+        if ids and ids[0] in self.doc.constraints:
+            c = self.doc.constraints[ids[0]]
+            self.constraint_kind.set(c["kind"])
+            self.constraint_refs.set(",".join(c["refs"]))
+            self.constraint_value.set(str(c.get("value", "")))
+            self.constraint_parameters.set(
+                ",".join(str(t) for t in c.get("parameters", [0.5, 0.5]))
+            )
+
+    def constraint_add(self):
+        kind = self.constraint_kind.get()
+        dimensional = kind in (
+            "length",
+            "radius",
+            "width",
+            "height",
+            "distance",
+            "angle",
+            "angle_between",
+            "arc_start",
+            "arc_sweep",
+            "rx",
+            "ry",
+        )
+        value = (
+            ScriptEngine(self.doc).number(self.constraint_value.get())
+            if dimensional
+            else None
+        )
+        self.doc.constrain(
+            kind,
+            [r.strip() for r in self.constraint_refs.get().split(",")],
+            value,
+            parameters=[
+                ScriptEngine(self.doc).number(t.strip())
+                for t in self.constraint_parameters.get().split(",")
+            ]
+            if kind in ("curve_tangent", "free_tangent")
+            else None,
+        )
+        self.changed("Constraint added and sketch solved")
+
+    def constraint_drive(self):
+        ids = self.constraint_tree.selection()
+        if not ids:
+            raise ValueError("Select a driving constraint first.")
+        if self.doc.constraints[ids[0]]["kind"] in ("curve_tangent", "free_tangent"):
+            self.doc.set_constraint_parameters(
+                ids[0],
+                [
+                    ScriptEngine(self.doc).number(t.strip())
+                    for t in self.constraint_parameters.get().split(",")
+                ],
+            )
+        else:
+            self.doc.set_constraint_value(
+                ids[0], ScriptEngine(self.doc).number(self.constraint_value.get())
+            )
         self.changed("Driving value updated; sketch solved")
 
     def constraint_remove(self):
