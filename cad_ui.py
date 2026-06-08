@@ -1,3 +1,443 @@
+UNCONSTRAIN width
+Supported: fixed, horizontal, vertical, length, angle, radius, width, height,
+coincident, distance, parallel, perpendicular, equal_length, concentric, tangent,
+curve_tangent and free_tangent.
+Tangent supports a line/circle or two externally tangent circles. Curve tangent takes
+two explicit normalized contact parameters (0..1). Free tangent solves the contact
+locations from your initial guesses and saves the solved values. Driving
+rules are distinct from measurement annotations. Solver is local; DOF is a
+numerical diagnostic. See README for tolerances, references and format limits.
+This application handles planar drafting. Exact analytic general offsets,
+CAM and universal curve-topology guarantees are not implemented. Round path supports
+polyline/rectangle corners; Tangents constructs common circle/arc tangents.
+Clean offset repairs planar regions and retains all components. Cleanup as filled
+regions keeps exterior and holes together. Linked components split/merge; vanished
+components retire their dependent branches. Undo restores them. Choose a feature
+ID to update or detach a feature even if its output is temporarily empty.
+REGION material rings='[[[0,0],[40,0],[40,30],[0,30]],[[10,10],[20,10],[20,20],[10,20]]]' hatch=cross spacing=3
+Region rings are local JSON coordinates; exterior first, then holes. Create/edit
+via properties, code or vertex grips. Patterns follow placement and orientation.
+Solid, lines and cross patterns are available; invalid boundaries roll back.
+Extension snaps use nearby virtual line/arc supports without editing the source.
+"""
+
+DEFAULTS = {
+    "point": {},
+    "line": {"length": "40"},
+    "rectangle": {"width": "40", "height": "25", "fill": "false"},
+    "circle": {"radius": "10"},
+    "arc": {"radius": "15", "start": "0", "sweep": "90"},
+    "ellipse": {"rx": "20", "ry": "10", "start": "0", "sweep": "360"},
+    "region": {
+        "rings": "[[[0,0],[40,0],[40,30],[0,30]],[[10,10],[20,10],[20,20],[10,20]]]",
+        "hatch": "solid",
+        "spacing": "2",
+        "hatch_angle": "45",
+    },
+    "polyline": {"points": "0,0;30,0;30,20", "closed": "false", "fill": "false"},
+    "bezier": {"points": "0,0;10,20;30,20;40,0"},
+    "text": {"text": "Part A", "height": "3"},
+    "dimension": {"points": "0,0;40,0", "offset": "8"},
+    "radial_dimension": {"radius": "10"},
+    "angular_dimension": {"radius": "15", "start": "0", "sweep": "90"},
+}
+TOOLS = (
+    "Select",
+    "Line",
+    "Rectangle",
+    "Circle",
+    "Arc",
+    "Ellipse",
+    "Polyline",
+    "Bezier",
+    "Point",
+    "Text",
+    "Dimension",
+    "Radial dimension",
+    "Angular dimension",
+)
+
+
+class Viewport:
+    def __init__(self):
+        self.scale, self.ox, self.oy = 5.0, 90.0, 550.0
+
+    def screen(self, p):
+        return self.ox + p[0] * self.scale, self.oy - p[1] * self.scale
+
+    def world(self, x, y):
+        return (x - self.ox) / self.scale, (self.oy - y) / self.scale
+
+    def zoom(self, factor, x, y):
+        p = self.world(x, y)
+        self.scale = max(0.0001, min(1e6, self.scale * factor))
+        self.ox, self.oy = x - p[0] * self.scale, y + p[1] * self.scale
+
+    def fit(self, box, width, height):
+        x0, y0, x1, y1 = box
+        self.scale = max(
+            0.0001,
+            min(
+                (max(100, width) - 80) / max(x1 - x0, 1),
+                (max(100, height) - 80) / max(y1 - y0, 1),
+                1e6,
+            ),
+        )
+        self.ox = width / 2 - (x0 + x1) / 2 * self.scale
+        self.oy = height / 2 + (y0 + y1) / 2 * self.scale
+
+
+class App(DraftingPanels):
+    def __init__(self, root, load_example=True):
+        self.root = root
+        self.doc = Document()
+        self.view = Viewport()
+        self.selection = []
+        self.pending, self.preview = [], {}
+        self.drag = self.pan = self.hover = None
+        self.filename = None
+        self.saved_state = self.doc.snapshot()
+        self.root.title("Geometric Drawer · 2-D CAD")
+        self.root.geometry("1480x930")
+        self.root.minsize(1120, 720)
+        self.status = tk.StringVar(value="Ready · drawing units mm")
+        self.coords = tk.StringVar(value="X 0.000  Y 0.000 mm")
+        self.tool = tk.StringVar(value="Select")
+        self.grid = tk.BooleanVar(value=True)
+        self.grid_snap = tk.BooleanVar(value=False)
+        self.object_snap = tk.BooleanVar(value=True)
+        self.perpendicular_snap = tk.BooleanVar(value=False)
+        self.tangent_snap = tk.BooleanVar(value=False)
+        self.nearest_snap = tk.BooleanVar(value=False)
+        self.extension_snap = tk.BooleanVar(value=False)
+        self.linked_features = tk.BooleanVar(value=True)
+        self.cleanup_join = tk.StringVar(value="round")
+        self.cleanup_regions = tk.BooleanVar(value=True)
+        self.feature_target = tk.StringVar()
+        self.snap_info = tk.StringVar(value="Snap: —")
+        self.ortho = tk.BooleanVar(value=False)
+        self.spacing = tk.StringVar(value="5")
+        self.unit_var = tk.StringVar(value="mm")
+        self.kind_var = tk.StringVar(value="rectangle")
+        self.replace_script = tk.BooleanVar(value=False)
+        self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<Control-s>", lambda e: self.save_file())
+        self.root.bind("<Control-o>", lambda e: self.open_file())
+        self.root.bind("<Control-n>", lambda e: self.new_file())
+        if load_example:
+            self.editor.insert("1.0", EXAMPLE)
+            ScriptEngine(self.doc).execute(EXAMPLE)
+            self.doc._undo.clear()
+        self.changed()
+        self.root.after(100, self.fit)
+
+    def _build(self):
+        available_families = set(tkfont.families(self.root))
+        ui_family = next(
+            (
+                family
+                for family in ("DejaVu Sans", "Noto Sans", "Arial")
+                if family in available_families
+            ),
+            tkfont.nametofont("TkDefaultFont").actual("family"),
+        )
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            tkfont.nametofont(name).configure(family=ui_family, size=10)
+        tkfont.nametofont("TkFixedFont").configure(size=10)
+        style = ttk.Style()
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("TButton", padding=(7, 5))
+        style.configure(".", background="#edf2f7", foreground="#243e58")
+        style.configure(
+            "Treeview", background="white", fieldbackground="white", rowheight=24
+        )
+        style.configure("Title.TLabel", font=(ui_family, 12, "bold"))
+        menu = tk.Menu(self.root)
+        file = tk.Menu(menu, tearoff=False)
+        for text, fn in [
+            ("New", self.new_file),
+            ("Open drawing…", self.open_file),
+            ("Save", self.save_file),
+            ("Save as…", lambda: self.save_file(True)),
+            ("Import DXF / DWG…", self.open_dxf),
+            ("Import legacy track…", self.open_legacy),
+            ("Export DXF…", lambda: self.export("dxf")),
+            ("Export DWG (ODA)…", lambda: self.export("dwg")),
+            ("Export SVG…", lambda: self.export("svg")),
+            ("Export PDF (1:1)…", lambda: self.export("pdf")),
+        ]:
+            file.add_command(label=text, command=fn)
+        file.add_separator()
+        file.add_command(label="Exit", command=self.close)
+        menu.add_cascade(label="File", menu=file)
+        edit = tk.Menu(menu, tearoff=False)
+        for text, fn in [
+            ("Undo", self.undo),
+            ("Redo", self.redo),
+            ("Delete selection", self.delete),
+            ("Select all unlocked", self.select_all),
+            ("Dimension selection", self.dimension_selection),
+        ]:
+            edit.add_command(label=text, command=lambda f=fn: self.safe(f))
+        menu.add_cascade(label="Edit", menu=edit)
+        menu.add_command(label="Fit drawing", command=self.fit)
+        menu.add_command(label="Help", command=lambda: self.tabs.select(self.help_tab))
+        self.root.configure(menu=menu)
+
+        top = ttk.Frame(self.root, padding=(10, 8))
+        top.pack(fill="x")
+        ttk.Label(top, text="GEOMETRIC DRAWER", style="Title.TLabel").pack(
+            side="left", padx=(0, 20)
+        )
+        self.tool_box = ttk.Combobox(
+            top, textvariable=self.tool, values=TOOLS, state="readonly", width=20
+        )
+        self.tool_box.pack(side="left")
+        self.tool_box.bind("<<ComboboxSelected>>", lambda e: self.cancel())
+        for title, fn in [
+            ("Fit", self.fit),
+            ("Undo", self.undo),
+            ("Redo", self.redo),
+            ("Delete", self.delete),
+        ]:
+            ttk.Button(top, text=title, command=lambda f=fn: self.safe(f)).pack(
+                side="left", padx=3
+            )
+        for text, var in [
+            ("Grid", self.grid),
+            ("Grid snap", self.grid_snap),
+            ("Object snap", self.object_snap),
+            ("Ortho", self.ortho),
+        ]:
+            ttk.Checkbutton(
+                top, text=text, variable=var, command=self.snap_settings_changed
+            ).pack(side="left", padx=4)
+        ttk.Entry(top, textvariable=self.spacing, width=5).pack(side="left")
+        ttk.Label(top, text="spacing").pack(side="left", padx=(3, 10))
+        unit_box = ttk.Combobox(
+            top,
+            textvariable=self.unit_var,
+            values=list(UNIT_MM),
+            state="readonly",
+            width=4,
+        )
+        unit_box.pack(side="right")
+        unit_box.bind("<<ComboboxSelected>>", lambda e: self.safe(self.change_units))
+
+        snap_bar = ttk.Frame(self.root, padding=(10, 0, 10, 4))
+        snap_bar.pack(fill="x")
+        for title, var in (
+            ("Nearest", self.nearest_snap),
+            ("Perpendicular", self.perpendicular_snap),
+            ("Tangent", self.tangent_snap),
+            ("Extension", self.extension_snap),
+        ):
+            ttk.Checkbutton(
+                snap_bar, text=title, variable=var, command=self.snap_settings_changed
+            ).pack(side="left", padx=(0, 12))
+        ttk.Label(
+            snap_bar,
+            text="Object snap required; reference modes need a preceding point.",
+        ).pack(side="left")
+        ttk.Label(snap_bar, textvariable=self.snap_info).pack(side="right")
+
+        body = ttk.Panedwindow(self.root, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        left = ttk.Frame(body, width=210, padding=(0, 0, 8, 0))
+        body.add(left, weight=0)
+        ttk.Label(left, text="DRAWING", style="Title.TLabel").pack(
+            anchor="w", pady=(4, 8)
+        )
+        tree_frame = ttk.Frame(left)
+        tree_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=("kind",),
+            show="tree headings",
+            selectmode="extended",
+            height=13,
+        )
+        self.tree.heading("#0", text="Entity")
+        self.tree.heading("kind", text="Type")
+        self.tree.column("#0", width=110, stretch=True)
+        self.tree.column("kind", width=80, stretch=False)
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self.tree_select)
+        ttk.Button(
+            left,
+            text="Dimension selection",
+            command=lambda: self.safe(self.dimension_selection),
+        ).pack(fill="x", pady=6)
+        ttk.Label(left, text="LAYERS", style="Title.TLabel").pack(
+            anchor="w", pady=(12, 4)
+        )
+        self.layer_var = tk.StringVar(value="0")
+        self.layer_box = ttk.Combobox(
+            left, textvariable=self.layer_var, state="readonly", width=22
+        )
+        self.layer_box.pack(fill="x")
+        self.layer_box.bind(
+            "<<ComboboxSelected>>", lambda e: self.safe(self.choose_layer)
+        )
+        self.layer_info = tk.StringVar()
+        ttk.Label(left, textvariable=self.layer_info, wraplength=200).pack(
+            anchor="w", pady=6
+        )
+        for title, fn in [
+            ("New layer…", self.new_layer),
+            ("Color…", self.color_layer),
+            ("Toggle visibility", lambda: self.toggle_layer("visible")),
+            ("Toggle lock", lambda: self.toggle_layer("locked")),
+        ]:
+            ttk.Button(left, text=title, command=lambda f=fn: self.safe(f)).pack(
+                fill="x", pady=2
+            )
+
+        center = ttk.Frame(body)
+        body.add(center, weight=4)
+        self.canvas = tk.Canvas(
+            center,
+            background="#f8fafc",
+            highlightthickness=1,
+            highlightbackground="#c5d1dc",
+            cursor="crosshair",
+        )
+        self.canvas.pack(fill="both", expand=True)
+        for event, fn in [
+            ("<Configure>", lambda e: self.redraw()),
+            ("<ButtonPress-1>", self.press),
+            ("<B1-Motion>", self.motion),
+            ("<ButtonRelease-1>", self.release),
+            ("<Motion>", self.motion),
+            ("<MouseWheel>", self.wheel),
+            ("<Button-4>", self.wheel),
+            ("<Button-5>", self.wheel),
+            ("<ButtonPress-2>", self.pan_start),
+            ("<B2-Motion>", self.pan_motion),
+            ("<Escape>", lambda e: self.cancel(True)),
+            ("<Return>", lambda e: self.safe(self.finish_polyline)),
+            ("<Delete>", lambda e: self.safe(self.delete)),
+            ("<Control-z>", lambda e: self.undo()),
+            ("<Control-y>", lambda e: self.redo()),
+            ("<Control-a>", lambda e: self.select_all()),
+        ]:
+            self.canvas.bind(event, fn)
+        ttk.Label(
+            center,
+            text="Wheel: zoom  ·  Middle drag: pan  ·  Shift-click: multi-select  ·  Esc: cancel  ·  Enter: finish polyline",
+        ).pack(anchor="w", pady=(4, 0))
+
+        right = ttk.Frame(body, width=340, padding=(8, 0, 0, 0))
+        body.add(right, weight=1)
+        self.tabs = ttk.Notebook(right)
+        self.tabs.pack(fill="both", expand=True)
+        properties_tab = ttk.Frame(self.tabs)
+        self.tabs.add(properties_tab, text="Control panel")
+        prop_scroll = tk.Canvas(
+            properties_tab, highlightthickness=0, width=340, background="#edf2f7"
+        )
+        prop_bar = ttk.Scrollbar(
+            properties_tab, orient="vertical", command=prop_scroll.yview
+        )
+        prop_scroll.configure(yscrollcommand=prop_bar.set)
+        prop_bar.pack(side="right", fill="y")
+        prop_scroll.pack(side="left", fill="both", expand=True)
+        properties = ttk.Frame(prop_scroll, padding=8)
+        prop_window = prop_scroll.create_window(0, 0, window=properties, anchor="nw")
+        properties.bind(
+            "<Configure>",
+            lambda e: prop_scroll.configure(scrollregion=prop_scroll.bbox("all")),
+        )
+        prop_scroll.bind(
+            "<Configure>",
+            lambda e: prop_scroll.itemconfigure(prop_window, width=e.width),
+        )
+        code = ttk.Frame(self.tabs, padding=6)
+        self.tabs.add(code, text="Code")
+        self.build_constraint_panel()
+        self.build_drafting_panels()
+        self.help_tab = ttk.Frame(self.tabs)
+        self.tabs.add(self.help_tab, text="Guide")
+        kind_box = ttk.Combobox(
+            properties, textvariable=self.kind_var, values=KINDS, state="readonly"
+        )
+        kind_box.pack(fill="x")
+        kind_box.bind("<<ComboboxSelected>>", lambda e: self.property_form())
+        self.prop_frame = ttk.Frame(properties)
+        self.prop_frame.pack(fill="x", pady=8)
+        self.props = {}
+        self.property_form()
+        row = ttk.Frame(properties)
+        row.pack(fill="x", pady=5)
+        ttk.Button(
+            row, text="Create", command=lambda: self.safe(self.create_properties)
+        ).pack(side="left", expand=True, fill="x")
+        ttk.Button(
+            row,
+            text="Apply to selection",
+            command=lambda: self.safe(self.apply_properties),
+        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        self.selection_info = tk.StringVar(value="No selection")
+        ttk.Label(properties, textvariable=self.selection_info, wraplength=315).pack(
+            anchor="w", pady=5
+        )
+        ttk.Separator(properties).pack(fill="x", pady=8)
+        ttk.Label(properties, text="MODIFY", style="Title.TLabel").pack(anchor="w")
+        fields = ttk.Frame(properties)
+        fields.pack(fill="x", pady=6)
+        self.transform_vars = {}
+        for i, (k, val) in enumerate(
+            [
+                ("dx", "10"),
+                ("dy", "0"),
+                ("rotation", "90"),
+                ("factor", "1"),
+                ("pivot x", "0"),
+                ("pivot y", "0"),
+                ("amount", "5"),
+                ("count", "4"),
+                ("curve tol", "0.01"),
+            ]
+        ):
+            ttk.Label(fields, text=k).grid(
+                row=i // 2, column=(i % 2) * 2, sticky="w", padx=(0, 4), pady=2
+            )
+            v = tk.StringVar(value=val)
+            self.transform_vars[k] = v
+            ttk.Entry(fields, textvariable=v, width=9).grid(
+                row=i // 2, column=(i % 2) * 2 + 1, sticky="ew", padx=(0, 8), pady=2
+            )
+        ttk.Checkbutton(
+            properties,
+            text="Linked (edit sources; detach to edit results)",
+            variable=self.linked_features,
+        ).pack(anchor="w")
+        ttk.Combobox(
+            properties,
+            textvariable=self.cleanup_join,
+            values=("round", "mitre", "bevel"),
+            state="readonly",
+            width=12,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            properties, text="Cleanup as filled regions", variable=self.cleanup_regions
+        ).pack(anchor="w")
+        ttk.Label(properties, text="Feature ID (for hidden/empty results)").pack(
+            anchor="w"
+        )
+        self.feature_box = ttk.Combobox(
+            properties, textvariable=self.feature_target, state="readonly"
+        )
+        self.feature_box.pack(fill="x")
+        buttons = ttk.Frame(properties)
+        buttons.pack(fill="x")
+        for i, op in enumerate(
+            (
                 "Move",
                 "Copy",
                 "Rotate",
