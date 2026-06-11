@@ -1,0 +1,11 @@
+# Enable Object snap and the desired reference mode, then use Line.
+UNITS mm
+LAYER references color=#007f84 width=0.3
+CIRCLE disk x=0 y=0 radius=5 layer=references
+POINT tangent_start x=10 y=0 layer=references
+TEXT tangent_hint x=-7 y=-9 height=2 text="Tangent: start at (10,0), finish near (2.5,4.33)"
+LINE slope x=20 y=0 length=20*sqrt(2) angle=45 layer=references
+POINT normal_start x=40 y=0 layer=references
+TEXT normal_hint x=20 y=-5 height=2 text="Perpendicular: (40,0) to (30,10)"
+RECT rotated_box x=-25 y=0 width=10 height=15 angle=15 layer=references
+POLY outline x=20 y=30 points="0,0;20,0;20,12" closed=true layer=references

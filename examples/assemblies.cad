@@ -1,0 +1,18 @@
+# Reuse a holed and patterned plate at three different placements.
+UNITS mm
+REGION panel rings="[[[0,0],[30,0],[30,20],[0,20]],[[10,6],[20,6],[20,14],[10,14]]]"
+PATTERN panel name=DASHED_PANEL data="[[0,[0,0],[0,3],[3,-1]],[90,[0,0],[-3,0],[]]]"
+CIRCLE pin x=5 y=10 radius=2
+BLOCK bracket refs=panel,pin
+INSERT bracket id=first x=10 y=10
+INSERT bracket id=second x=70 y=10 angle=30 scale=1.2
+INSERT bracket id=third x=130 y=40 angle=-30 mirror=true
+DELETE panel
+DELETE pin
+# Placement drivers use feature targets, while definitions store geometry snapshots.
+PARAM pitch expression=70 kind=length units=mm
+BIND second target=feature property=x expression=pitch units=mm
+# Group ordinary dimensions/labels without changing their geometry.
+TEXT label_a x=10 y=-8 height=3 text="Reusable bracket"
+LINE underline x=10 y=-10 length=32
+GROUP label label_a underline

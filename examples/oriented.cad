@@ -1,0 +1,9 @@
+# Placement/orientation and exact corner operations.
+RECT oriented x=100 y=50 width=40 height=20 angle=90
+LINE horizontal x=0 y=0 length=40
+LINE vertical x=0 y=0 length=30 angle=90
+FILLET horizontal vertical radius=5
+ARC arc x=60 y=20 radius=15 start=20 sweep=-120
+ELLIPSE oval x=60 y=60 rx=18 ry=8 angle=30
+BEZIER curve points="0,50;10,75;30,75;40,50"
+ADIM angle x=110 y=20 radius=12 start=0 sweep=90

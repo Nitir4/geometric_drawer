@@ -1,0 +1,17 @@
+# Linked geometry: source controls drive the results; DETACH makes them ordinary.
+UNITS mm
+LAYER guides color=#b36b21 width=0.15
+LAYER parts color=#243e58 width=0.25
+USE parts
+LINE leg_a x=0 y=0 length=30
+LINE leg_b x=30 y=0 length=25 angle=90
+FILLET leg_a leg_b radius=4
+RECT plate x=50 y=0 width=35 height=25
+ROUND plate radius=3 tolerance=0.02
+CIRCLE pulley_a x=10 y=55 radius=8
+CIRCLE pulley_b x=40 y=55 radius=5
+TANGENTS pulley_a pulley_b kind=external
+ELLIPSE oval x=80 y=55 rx=14 ry=8
+OFFSET oval distance=2 tolerance=0.02
+POLYLINE crossed points="100,0;120,20;100,20;120,0" closed=true
+CLEANOFFSET crossed distance=0 join=round tolerance=0.02

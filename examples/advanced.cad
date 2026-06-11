@@ -1,0 +1,17 @@
+# Compound material: outer ring followed by holes, coordinates local to its pose.
+UNITS mm
+LAYER material color=#007f84 width=0.3
+REGION plate x=10 y=10 angle=0 rings='[[[0,0],[60,0],[60,40],[0,40]],[[15,10],[45,10],[45,30],[15,30]]]' hatch=cross spacing=4 hatch_angle=30
+REGION solid_plate x=85 y=10 rings='[[[0,0],[60,0],[60,40],[0,40]],[[15,10],[45,10],[45,30],[15,30]]]' hatch=solid
+# Repair a self-crossing path: two regions; editing distance merges them.
+LAYER cleanup color=#a65c24 width=0.25
+POLYLINE bow x=15 y=75 points='0,0;20,20;0,20;20,0' closed=true construction=true
+CLEANOFFSET bow distance=0 join=round tolerance=0.01 regions=true
+# Free tangent contact parameters are initial guesses, not fixed locations.
+LAYER sketch color=#334988 width=0.25
+ELLIPSE oval x=100 y=90 rx=12 ry=8
+LINE contact x=75 y=101 length=50
+CONSTRAINT anchor kind=fixed refs=oval
+CONSTRAINT level kind=horizontal refs=contact
+CONSTRAINT size kind=length refs=contact value=50
+CONSTRAINT tangent kind=free_tangent refs=oval,contact parameters=0.1,0.7

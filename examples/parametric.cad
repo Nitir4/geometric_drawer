@@ -1,0 +1,30 @@
+# Change width or height in Parameters: the plate and Boolean holes regenerate.
+UNITS mm
+PARAM width expression=80 kind=length
+PARAM height expression=40 kind=length
+PARAM hole_radius expression=5 kind=length
+PARAM pitch expression=width/2 kind=length
+RECT plate width=80 height=40
+BIND plate property=width expression=width
+BIND plate property=height expression=height
+CIRCLE left_hole x=20 y=20 radius=5
+CIRCLE right_hole x=60 y=20 radius=5
+BIND left_hole property=x expression=width/4
+BIND left_hole property=y expression=height/2
+BIND left_hole property=radius expression=hole_radius
+BIND right_hole property=x expression=3*width/4
+BIND right_hole property=y expression=height/2
+BIND right_hole property=radius expression=hole_radius
+DIFFERENCE plate left_hole right_hole tolerance=0.01
+# Exact analytic trimming of an ellipse; pick removes the right-hand side.
+ELLIPSE oval x=110 y=20 rx=20 ry=10
+LINE cut x=110 y=0 x2=110 y2=40
+TRIM oval boundary=cut x=130 y=20
+DELETE cut
+# Directed line angle and explicit signed arc extent.
+LINE datum x=0 y=-20 length=25 angle=0
+CONSTRAINT datum_fixed kind=fixed refs=datum
+LINE slope x=30 y=-20 length=25 angle=0
+CONSTRAINT slope_angle kind=angle_between refs=datum,slope value=30
+ARC arc_demo x=100 y=-20 radius=10 start=0 sweep=90
+CONSTRAINT arc_extent kind=arc_sweep refs=arc_demo value=-120

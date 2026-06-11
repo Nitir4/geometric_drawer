@@ -1,3 +1,183 @@
+"""Tk drafting workspace: one document, numeric / command / direct editing."""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import tkinter as tk
+import tkinter.font as tkfont
+from pathlib import Path
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
+
+try:
+    from .cad_document import UNIT_MM, Document
+    from .cad_exchange import (
+        export_dwg,
+        export_dxf,
+        export_pdf,
+        export_svg,
+        import_dwg,
+        import_dxf,
+    )
+    from .cad_geometry import (
+        EPS,
+        KINDS,
+        Entity,
+        add,
+        angle,
+        distance,
+        polar,
+        positive,
+        rotate,
+        sub,
+    )
+    from .cad_operations import finite_intersections, on_curve
+    from .cad_panels import DraftingPanels
+    from .cad_script import ScriptEngine, document_script, import_legacy
+    from .cad_snap import curve_parts, extension_part, nearest_point, reference_points
+except ImportError:
+    from cad_document import UNIT_MM, Document
+    from cad_exchange import (
+        export_dwg,
+        export_dxf,
+        export_pdf,
+        export_svg,
+        import_dwg,
+        import_dxf,
+    )
+    from cad_geometry import (
+        EPS,
+        KINDS,
+        Entity,
+        add,
+        angle,
+        distance,
+        polar,
+        positive,
+        rotate,
+        sub,
+    )
+    from cad_operations import finite_intersections, on_curve
+    from cad_panels import DraftingPanels
+    from cad_script import ScriptEngine, document_script, import_legacy
+    from cad_snap import curve_parts, extension_part, nearest_point, reference_points
+
+EXAMPLE = """# A 120 x 70 mm plate, with a four-hole pattern.
+UNITS mm
+LAYER outline color=#243e58 width=0.35
+LAYER holes color=#007f84 width=0.25
+LAYER notes color=#865b13 width=0.2
+RECT plate x=0 y=0 width=120 height=70 layer=outline
+LET pitch=30
+CIRCLE hole x=15 y=35 radius=5 layer=holes
+ARRAY hole count=4 dx=pitch
+LINE baseline x=0 y=-10 length=120 layer=notes construction=true
+DIM width entity=baseline offset=-8 layer=notes
+RDIM radius entity=hole layer=notes
+TEXT title x=0 y=80 height=4 text="120 x 70 mounting plate" layer=notes
+"""
+
+HELP = """GEOMETRIC DRAWER · 2-D CAD
+
+Coordinates are X-right, Y-up. Angles are degrees counterclockwise from +X.
+Lengths use the displayed drawing units. Changing units converts the geometry.
+
+THREE WAYS TO EDIT
+• Control panel: choose a type, enter exact properties, Create. Select an entity
+  to inspect it; Apply changes its placement, orientation and dimensions.
+• Canvas: choose a tool and click the required points. Select then drag to move;
+  drag square handles to edit geometry, or the round orange grip to rotate.
+  Shift-click toggles multiple selection.
+  Drag empty space to select entities fully inside a window. Locked layers
+  remain visible but cannot be selected or edited.
+• Code: run CAD commands below. Replace drawing is explicit. A failed script
+  rolls back completely. “Drawing → code” captures current edits as a script.
+
+CANVAS
+Wheel zooms around the cursor. Middle drag pans. Fit shows visible geometry.
+Grid snap rounds to the chosen spacing. Object snap finds endpoints, midpoints,
+centres, quadrants and finite line/circle/arc/rectangle/polyline-edge/ellipse/Bezier
+intersections. Nearest captures the closest actual finite curve point. Bezier control
+grips edit its shape but do not supply off-curve object snap points.
+Enable Perpendicular or Tangent below the toolbar to finish a segment from its
+preceding point at a finite normal foot or curve tangent contact. Ellipses and
+Beziers support both modes; circle/ellipse tangent needs an external start point. The readout shows the captured mode; both modes default
+off and require Object snap. These placements do not create driving constraints.
+Exact object snaps take priority over Ortho. Otherwise Ortho restricts drafting
+to horizontal/vertical from the preceding point. Esc cancels a tool/gesture;
+Enter finishes a polyline. Delete removes selected entities. Ctrl+Z/Y undo/redo
+when focus is on the canvas; text fields keep their own editing shortcuts.
+
+TOOLS
+Line/rectangle/ellipse: two clicks. Circle/radial dimension: centre then edge.
+Arc/angular dimension: centre, start, end (CCW). Bezier: four control points.
+Polyline: multiple clicks, Enter to finish. Text/point: one click.
+Linear dimension: two endpoints, then offset; a dimension made from a selected
+line/circle/arc using “Dimension selection” follows that source automatically.
+
+MODIFY
+Move/copy use dx,dy. Rotate/scale use pivot x,y. Mirror uses the pivot and
+rotation field as its axis angle. Array count includes the original.
+Offset supports lines/open polylines (positive left), circles/arcs, rectangles
+and closed polylines/ellipses (positive outward), Beziers (positive left). Ellipse/Bezier
+offsets are editable polylines with curve tol controlling chord error in drawing units.
+The source stays analytic; offsets stay linked by default. Select sources to edit,
+or Detach to make results independent. Linked fillets keep dashed untrimmed sources. Cusps/folds, stationary
+tangents, overlapping/crossing output paths and exhausted accuracy budgets reject
+the operation. Smaller curve tol makes a finer path.
+Trim/extend supports lines, circles and
+arcs: select target first, boundary second; pivot x,y picks
+the end to trim. Boundary is its infinite straight line. Fillet/chamfer use two
+nonparallel straight lines; amount is radius / equal setback. Separated legs
+extend as needed. For crossing lines, set pivot x,y inside the corner to retain.
+Conflicting driving constraints reject the corner instead of breaking its joins.
+
+COMMAND EXAMPLES
+LET pitch=25
+LINE edge x=0 y=0 length=100 angle=30
+RECT plate x=10 y=20 width=80 height=40 angle=15
+CIRCLE hole x=20 y=30 radius=5
+ARC corner x=0 y=0 radius=10 start=0 sweep=-90
+ELLIPSE oval x=50 y=30 rx=20 ry=10 angle=30
+POLY path points="0,0;20,0;20,20" closed=true
+BEZIER curve points="0,0;10,20;30,20;40,0"
+TEXT label x=0 y=50 height=3 text="Part A"
+DIM length entity=edge offset=8
+MOVE plate dx=10 dy=5
+ROTATE plate angle=45 px=10 py=20
+COPY hole dx=pitch
+ARRAY hole count=4 dx=pitch
+MIRROR plate x1=0 y1=0 x2=0 y2=1 copy=true
+OFFSET edge distance=5
+FILLET line1 line2 radius=4
+CHAMFER line1 line2 distance=4
+TRIM edge boundary=cutter x=0 y=0
+DELETE hole
+Expressions accept arithmetic, pi, sin/cos/tan, sqrt, radians/degrees and abs.
+Quote expressions containing spaces. Math trigonometric functions use radians.
+ENTITY lines generated by Drawing → code preserve every native property.
+
+FILES
+Native .gdraw JSON preserves all editable geometry and dimensions. Save the
+native file for continued work. DXF preserves supported analytic CAD geometry;
+dimensions become static annotations; filled polygons export as solid HATCH.
+Blocks expand; MTEXT becomes plain text; hatches retain regions, holes and patterns.
+Partial ellipses remain analytic; non-cubic/rational splines use tolerance-controlled polylines.
+Import details report these conversions. DWG uses optional ODA/GNU converters.
+Unsupported DXF types/3-D content are rejected with an error. SVG and PDF keep
+physical dimensions; printing must use Actual size/100%, not “fit to page”.
+Hidden layers and construction geometry are omitted from SVG/PDF; DXF carries
+all layers. Legacy track scripts can be imported through the File menu.
+
+DRIVING CONSTRAINTS
+The Constraints tab adds saved geometric rules. References are entity IDs or
+zero-based vertices (edge@0, edge@1). Choose a rule, references and value; add it.
+Select a saved rule to update its driving value or remove it. Geometry edits
+solve against these rules; conflicts roll back. Copies start unconstrained.
+CONSTRAINT width kind=length refs=edge value=80
+CONSTRAINT level kind=horizontal refs=edge
+DRIVE width value=120
 UNCONSTRAIN width
 Supported: fixed, horizontal, vertical, length, angle, radius, width, height,
 coincident, distance, parallel, perpendicular, equal_length, concentric, tangent,

@@ -1,0 +1,12 @@
+# A line anchored at the origin with a driving length.
+UNITS mm
+POINT origin x=0 y=0 construction=true
+LINE edge length=40
+CONSTRAINT anchor kind=fixed refs=origin
+CONSTRAINT join kind=coincident refs=edge@0,origin
+CONSTRAINT level kind=horizontal refs=edge
+CONSTRAINT width kind=length refs=edge value=80
+CIRCLE hole x=40 y=25 radius=8
+CONSTRAINT bore kind=radius refs=hole value=8
+DIM measure entity=edge offset=-8
+DRIVE width value=100
