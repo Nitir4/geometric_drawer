@@ -1,3 +1,169 @@
+"""Opt-in real Tk event tests. Run with CAD_GUI_TESTS=1 on a display."""
+
+import os
+import tkinter as tk
+from pathlib import Path
+
+import pytest
+
+from cad_document import Document
+from cad_script import ScriptEngine
+from cad_ui import EXAMPLE, App
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("CAD_GUI_TESTS") != "1",
+    reason="Native GUI tests require CAD_GUI_TESTS=1 and a display",
+)
+
+
+@pytest.fixture
+def app(monkeypatch):
+    root = tk.Tk()
+    # Request a floating test window so a tiling WM does not override the test size.
+    if root.tk.call("tk", "windowingsystem") == "x11":
+        root.wm_attributes("-type", "dialog")
+    errors = []
+    root.report_callback_exception = lambda *exc: errors.append(repr(exc))
+    monkeypatch.setattr(
+        "cad_ui.messagebox.showerror",
+        lambda title, message, **kw: errors.append(message),
+    )
+    a = App(root, load_example=False)
+    root.update()
+    root.focus_force()
+    for id in root.tk.call("after", "info"):
+        root.after_cancel(id)
+    a.view.scale, a.view.ox, a.view.oy = 4, 80, 450
+    a.object_snap.set(False)
+    a.grid_snap.set(False)
+    a.redraw()
+    yield a
+    root.destroy()
+    assert not errors, errors
+
+
+def button(widget, text):
+    for child in widget.winfo_children():
+        if (
+            child.winfo_class() in ("TButton", "Button", "TCheckbutton")
+            and child.cget("text") == text
+        ):
+            return child
+        found = button(child, text)
+        if found:
+            return found
+
+
+def event(a, name, p, **kw):
+    x, y = a.view.screen(p)
+    a.canvas.event_generate(name, x=round(x), y=round(y), **kw)
+    a.root.update()
+
+
+def click(a, p, **kw):
+    event(a, "<ButtonPress-1>", p, **kw)
+    event(a, "<ButtonRelease-1>", p, **kw)
+
+
+def drag(a, p, q):
+    event(a, "<ButtonPress-1>", p)
+    event(a, "<B1-Motion>", q)
+    event(a, "<ButtonRelease-1>", q)
+
+
+def test_numeric_panel_creation_orientation_apply_and_undo(app):
+    a = app
+    a.kind_var.set("rectangle")
+    a.property_form()
+    for k, v in {
+        "id": "plate",
+        "x": "100",
+        "y": "50",
+        "orientation": "90",
+        "width": "40",
+        "height": "20",
+    }.items():
+        a.props[k].set(v)
+    button(a.root, "Create").invoke()
+    a.root.update()
+    e = a.doc.entities["plate"]
+    assert e.vertices()[2] == pytest.approx((80, 90))
+    a.props["orientation"].set("0")
+    a.props["x"].set("30")
+    button(a.root, "Apply to selection").invoke()
+    a.root.update()
+    assert a.doc.entities["plate"].vertices()[2] == pytest.approx((70, 70))
+    a.undo()
+    assert a.doc.entities["plate"].vertices()[2] == pytest.approx((80, 90))
+    a.redo()
+    assert a.doc.entities["plate"].x == 30
+
+
+def test_code_run_and_manual_edit_share_document(app):
+    a = app
+    a.editor.insert(
+        "1.0", "LINE edge x=0 y=0 length=40\nCIRCLE hole x=20 y=20 radius=5"
+    )
+    button(a.root, "Run").invoke()
+    a.root.update()
+    drag(a, (20, 0), (30, 10))
+    assert a.doc.entities["edge"].vertices()[0] == pytest.approx((10, 10))
+    assert a.doc.entities["edge"].vertices()[1] == pytest.approx((50, 10))
+    a.drawing_to_code()
+    text = a.editor.get("1.0", "end-1c")
+    clone = Document()
+    ScriptEngine(clone).execute(text, replace=True)
+    assert clone.snapshot() == a.doc.snapshot()
+
+
+def test_canvas_line_creation_endpoint_handle_and_history(app):
+    a = app
+    a.tool.set("Line")
+    click(a, (5, 5))
+    click(a, (45, 5))
+    id = next(iter(a.doc.entities))
+    a.tool.set("Select")
+    old = a.doc.snapshot()
+    event(a, "<ButtonPress-1>", (45, 5))
+    event(a, "<B1-Motion>", (60, 15))
+    assert a.doc.snapshot() == old  # previews do not mutate the document
+    event(a, "<ButtonRelease-1>", (60, 15))
+    assert a.doc.entities[id].vertices()[1] == pytest.approx((60, 15))
+    a.undo()
+    assert a.doc.snapshot() == old
+
+
+def test_rectangle_handle_resize_and_round_grip_rotation(app):
+    a = app
+    id = a.doc.rectangle(20, 20, 20, 10)
+    a.selection = [id]
+    a.changed()
+    drag(a, (40, 30), (50, 40))
+    assert a.doc.entities[id].data["width"] == pytest.approx(30)
+    assert a.doc.entities[id].data["height"] == pytest.approx(20)
+    grip = a.rotation_handle(a.doc.entities[id])
+    drag(a, grip, (20 - (grip[1] - 20), 20 + (grip[0] - 20)))
+    assert a.doc.entities[id].angle == pytest.approx(90, abs=0.5)
+    a.undo()
+    assert a.doc.entities[id].angle == 0
+
+
+def test_direct_circle_arc_ellipse_polyline_and_bezier(app):
+    a = app
+    for tool, points, kind in [
+        ("Circle", [(10, 10), (15, 10)], "circle"),
+        ("Arc", [(30, 30), (40, 30), (30, 40)], "arc"),
+        ("Ellipse", [(50, 10), (70, 30)], "ellipse"),
+        ("Bezier", [(0, 50), (10, 70), (30, 70), (40, 50)], "bezier"),
+    ]:
+        a.tool.set(tool)
+        for p in points:
+            click(a, p)
+        assert a.doc.entities[a.selection[0]].kind == kind
+    a.tool.set("Polyline")
+    for p in [(60, 50), (80, 50), (80, 70)]:
+        click(a, p)
+    a.canvas.event_generate("<Return>")
     a.root.update()
     assert a.doc.entities[a.selection[0]].kind == "polyline"
     a.tool.set("Line")
