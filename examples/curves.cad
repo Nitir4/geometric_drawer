@@ -1,0 +1,9 @@
+# Ellipse/Bezier sources stay analytic; offsets become editable polylines.
+UNITS mm
+LAYER curves color=#007f84 width=0.3
+ELLIPSE oval x=0 y=0 rx=20 ry=10
+OFFSET oval distance=3 tolerance=0.02
+BEZIER bow x=55 y=-10 points="0,0;10,15;30,15;40,0"
+OFFSET bow distance=2 tolerance=0.02
+POINT tangent_start x=40 y=0
+TEXT hint x=-20 y=-22 height=2 text="Ellipse tangent: (40,0) to (10,8.6603). Curve tol controls offsets."

@@ -1,0 +1,12 @@
+# Non-meeting legs are extended to a tangent fillet.
+UNITS mm
+LAYER profile color=#007f84 width=0.4
+LINE lower x=7 y=0 length=23 layer=profile
+LINE upright x=0 y=9 length=21 angle=90 layer=profile
+FILLET lower upright radius=5
+TEXT rounded x=0 y=-7 height=2 text="Separated legs: radius 5 mm"
+# Pick the upper-left sector of these crossing segments.
+LINE across x=40 y=0 length=40 layer=profile
+LINE vertical x=60 y=-20 length=40 angle=90 layer=profile
+CHAMFER across vertical distance=5 x=50 y=10
+TEXT chamfered x=40 y=-7 height=2 text="Crossing legs: setback 5 mm"

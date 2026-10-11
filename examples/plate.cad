@@ -1,0 +1,15 @@
+# Millimetre plate and a parameterized hole pattern.
+UNITS mm
+LAYER outline color=#243e58 width=0.35
+LAYER holes color=#007f84 width=0.25
+LAYER notes color=#865b13 width=0.2
+LET width=120
+LET height=70
+LET pitch=30
+RECT plate x=0 y=0 width=width height=height layer=outline
+CIRCLE hole x=15 y=height/2 radius=5 layer=holes
+ARRAY hole count=4 dx=pitch
+LINE baseline x=0 y=-10 length=width layer=notes construction=true
+DIM width entity=baseline offset=-8 layer=notes
+RDIM radius entity=hole layer=notes
+TEXT title x=0 y=80 height=4 text="120 x 70 mounting plate" layer=notes
